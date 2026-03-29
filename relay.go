@@ -72,13 +72,30 @@ func New(dsn string, handler Handler, cfg Config) *Relay {
 }
 
 func (r *Relay) Start(ctx context.Context) error {
-	src, err := newWALListener(ctx, r.dsn, r.cfg)
-	if err != nil {
-		return err
-	}
-	defer src.Close(ctx)
+	delay := r.cfg.RetryDelay
+	for {
+		src, err := newWALListener(ctx, r.dsn, r.cfg)
+		if err == nil {
+			delay = r.cfg.RetryDelay
+			err = r.run(ctx, src)
+			src.Close(ctx)
+		}
 
-	return r.run(ctx, src)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		r.cfg.Logger.Error("outbox: connection error", "err", err, "retry_in", delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+		if delay > maxRetryDelay {
+			delay = maxRetryDelay
+		}
+	}
 }
 
 func (r *Relay) run(ctx context.Context, src source) error {
@@ -98,7 +115,7 @@ func (r *Relay) run(ctx context.Context, src source) error {
 
 		pendingConfirm = append(pendingConfirm, msg.ID)
 
-		if src.Buffered() == 0 {
+		if src.Remaining() == 0 {
 			if err := src.Confirm(ctx, pendingConfirm...); err != nil {
 				return err
 			}
