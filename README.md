@@ -1,5 +1,7 @@
 # outboxd
 
+> **Note:** This project is a work in progress and is not yet production-ready.
+
 A lightweight Go library for reliable and low-latency outbox publishing - bridging the gap between naive polling and full-blown CDC solutions like Debezium.
 
 When a service writes to the database and needs to notify other services, doing both in a single transaction is impossible (dual-write problem). The [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) solves this by writing events to an outbox table within the same transaction, then relaying them to a message broker separately.
