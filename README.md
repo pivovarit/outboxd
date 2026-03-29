@@ -20,7 +20,7 @@ When a service writes to the database and needs to notify other services, doing 
 The handler is just a function - return `nil` when done, return an error to retry:
 
 ```go
-handler := func(ctx context.Context, msg outbox.Message) error {
+handler := func(ctx context.Context, msg outboxd.Message) error {
     return rabbitCh.PublishWithContext(ctx, "exchange", msg.Topic, false, false,
         amqp.Publishing{Body: msg.Payload},
     )
@@ -30,7 +30,7 @@ handler := func(ctx context.Context, msg outbox.Message) error {
 That's it. Plug it in and start relaying:
 
 ```go
-relay := outbox.New(databaseURL, handler, outbox.Config{
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
     SlotName:     "outbox_relay",
     Publications: []string{"outbox_pub"},
 })
