@@ -80,7 +80,7 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 	}
 
 	schema := cfg.Schema
-	deleteQuery := fmt.Sprintf("DELETE FROM %s WHERE %s = $1",
+	deleteQuery := fmt.Sprintf("DELETE FROM %s WHERE %s = ANY($1)",
 		pgx.Identifier{schema.Table}.Sanitize(),
 		pgx.Identifier{schema.IDColumn}.Sanitize())
 
@@ -179,9 +179,13 @@ func (w *walListener) Next(ctx context.Context) (Message, error) {
 	}
 }
 
-func (w *walListener) Confirm(ctx context.Context, id int64) error {
-	if _, err := w.dbConn.Exec(ctx, w.deleteQuery, id); err != nil {
-		return fmt.Errorf("outbox: delete id=%d: %w", id, err)
+func (w *walListener) Buffered() int {
+	return len(w.buffered)
+}
+
+func (w *walListener) Confirm(ctx context.Context, ids ...int64) error {
+	if _, err := w.dbConn.Exec(ctx, w.deleteQuery, ids); err != nil {
+		return fmt.Errorf("outbox: delete ids=%v: %w", ids, err)
 	}
 	return w.sendStandbyStatus(ctx)
 }
