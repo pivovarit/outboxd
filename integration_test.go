@@ -1,6 +1,6 @@
 //go:build integration
 
-package outbox_test
+package outboxd_test
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	outbox "github.com/pivovarit/outboxd"
+	"github.com/pivovarit/outboxd"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
@@ -122,7 +122,7 @@ func TestIntegration_DeliversInOrder(t *testing.T) {
 		receivedIDs []int64
 		done        = make(chan struct{})
 	)
-	handler := func(_ context.Context, msg outbox.Message) error {
+	handler := func(_ context.Context, msg outboxd.Message) error {
 		mu.Lock()
 		receivedIDs = append(receivedIDs, msg.ID)
 		n := len(receivedIDs)
@@ -133,7 +133,7 @@ func TestIntegration_DeliversInOrder(t *testing.T) {
 		return nil
 	}
 
-	relay := outbox.New(dsn, handler, outbox.Config{
+	relay := outboxd.New(dsn, handler, outboxd.Config{
 		SlotName:     "test_slot_order",
 		Publications: []string{"outbox_pub"},
 		RetryDelay:   10 * time.Millisecond,
@@ -250,7 +250,7 @@ func TestIntegration_CustomSchema(t *testing.T) {
 		receivedIDs []int64
 		done        = make(chan struct{})
 	)
-	handler := func(_ context.Context, msg outbox.Message) error {
+	handler := func(_ context.Context, msg outboxd.Message) error {
 		mu.Lock()
 		receivedIDs = append(receivedIDs, msg.ID)
 		n := len(receivedIDs)
@@ -261,11 +261,11 @@ func TestIntegration_CustomSchema(t *testing.T) {
 		return nil
 	}
 
-	relay := outbox.New(dsn, handler, outbox.Config{
+	relay := outboxd.New(dsn, handler, outboxd.Config{
 		SlotName:     "test_slot_custom",
 		Publications: []string{"custom_outbox_pub"},
 		RetryDelay:   10 * time.Millisecond,
-		Schema: outbox.SchemaConfig{
+		Schema: outboxd.SchemaConfig{
 			Table:           "events_outbox",
 			IDColumn:        "event_id",
 			TopicColumn:     "event_type",
@@ -368,7 +368,7 @@ func TestIntegration_DeliversAllMessagesFromSingleTransaction(t *testing.T) {
 		receivedIDs []int64
 		done        = make(chan struct{})
 	)
-	handler := func(_ context.Context, msg outbox.Message) error {
+	handler := func(_ context.Context, msg outboxd.Message) error {
 		mu.Lock()
 		receivedIDs = append(receivedIDs, msg.ID)
 		n := len(receivedIDs)
@@ -379,7 +379,7 @@ func TestIntegration_DeliversAllMessagesFromSingleTransaction(t *testing.T) {
 		return nil
 	}
 
-	relay := outbox.New(dsn, handler, outbox.Config{
+	relay := outboxd.New(dsn, handler, outboxd.Config{
 		SlotName:     "test_slot_single_tx",
 		Publications: []string{"outbox_pub"},
 		RetryDelay:   10 * time.Millisecond,
@@ -442,7 +442,7 @@ func TestIntegration_RetriesOnHandlerError(t *testing.T) {
 		attempts int
 		done     = make(chan struct{})
 	)
-	handler := func(_ context.Context, msg outbox.Message) error {
+	handler := func(_ context.Context, msg outboxd.Message) error {
 		mu.Lock()
 		attempts++
 		a := attempts
@@ -454,7 +454,7 @@ func TestIntegration_RetriesOnHandlerError(t *testing.T) {
 		return nil
 	}
 
-	relay := outbox.New(dsn, handler, outbox.Config{
+	relay := outboxd.New(dsn, handler, outboxd.Config{
 		SlotName:     "test_slot_retry",
 		Publications: []string{"outbox_pub"},
 		RetryDelay:   10 * time.Millisecond,
