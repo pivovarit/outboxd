@@ -2,11 +2,11 @@
 
 > **Note:** This project is a work in progress and is not yet production-ready.
 
-A lightweight Go library for reliable and low-latency outbox publishing - bridging the gap between naive polling and full-blown CDC solutions like Debezium.
+A lightweight low-latency outbox event relay powered by PostgreSQL logical replication - bridging the gap between naive polling and full-blown CDC solutions like Debezium.
 
 When a service writes to the database and needs to notify other services, doing both in a single transaction is impossible (dual-write problem). The [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) solves this by writing events to an outbox table within the same transaction, then relaying them to a message broker separately.
 
-`outboxd` handles the relay part using PostgreSQL logical replication (WAL) - listening for changes via a replication slot and delivering messages to your handler as soon as they're committed. No external infrastructure beyond PostgreSQL, no complex deployment, no JVM.
+`outboxd` handles the relay part - it listens for changes via a replication slot and delivers messages to a handler you provide as soon as they're committed. The handler is just a Go function anyone can implement. Everything else (WAL streaming, replication slot management, retries, cleanup) is taken care of. No external infrastructure beyond PostgreSQL, no JVM.
 
 ## How it works
 
