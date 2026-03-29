@@ -25,6 +25,8 @@ type walListener struct {
 	payloadColumn   string
 	createdAtColumn string
 	deleteQuery     string
+
+	buffered []Message
 }
 
 func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, error) {
@@ -102,8 +104,14 @@ func (w *walListener) Close(ctx context.Context) {
 }
 
 func (w *walListener) Next(ctx context.Context) (Message, error) {
+	if len(w.buffered) > 0 {
+		msg := w.buffered[0]
+		w.buffered = w.buffered[1:]
+		return msg, nil
+	}
+
 	var (
-		pending *Message
+		pending []Message
 		txLSN   pglogrepl.LSN
 	)
 
@@ -158,12 +166,13 @@ func (w *walListener) Next(ctx context.Context) (Message, error) {
 				if err != nil {
 					return Message{}, err
 				}
-				pending = &msg
+				pending = append(pending, msg)
 
 			case *pglogrepl.CommitMessage:
-				if pending != nil {
+				if len(pending) > 0 {
 					w.lastLSN = txLSN
-					return *pending, nil
+					w.buffered = pending[1:]
+					return pending[0], nil
 				}
 			}
 		}
