@@ -318,6 +318,103 @@ func TestIntegration_CustomSchema(t *testing.T) {
 	}
 }
 
+func insertRowsInSingleTx(t *testing.T, dsn string, n int) []int64 {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+
+	ids := make([]int64, 0, n)
+	for i := 0; i < n; i++ {
+		var id int64
+		err = tx.QueryRow(ctx,
+			"INSERT INTO outbox (topic, payload) VALUES ($1, $2) RETURNING id",
+			"test-topic",
+			[]byte(fmt.Sprintf("payload-%d", i)),
+		).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+	return ids
+}
+
+func TestIntegration_DeliversAllMessagesFromSingleTransaction(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+	setupOutbox(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const messageCount = 3
+
+	var (
+		mu          sync.Mutex
+		receivedIDs []int64
+		done        = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outbox.Message) error {
+		mu.Lock()
+		receivedIDs = append(receivedIDs, msg.ID)
+		n := len(receivedIDs)
+		mu.Unlock()
+		if n == messageCount {
+			close(done)
+		}
+		return nil
+	}
+
+	relay := outbox.New(dsn, handler, outbox.Config{
+		SlotName:     "test_slot_single_tx",
+		Publications: []string{"outbox_pub"},
+		RetryDelay:   10 * time.Millisecond,
+	})
+
+	relayErr := make(chan error, 1)
+	go func() {
+		relayErr <- relay.Start(ctx)
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	insertedIDs := insertRowsInSingleTx(t, dsn, messageCount)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(receivedIDs) != messageCount {
+		t.Fatalf("expected %d messages, got %d (bug: only last INSERT per transaction is delivered)", messageCount, len(receivedIDs))
+	}
+	for i, want := range insertedIDs {
+		if receivedIDs[i] != want {
+			t.Errorf("message[%d]: want id %d, got %d", i, want, receivedIDs[i])
+		}
+	}
+}
+
 func TestIntegration_RetriesOnHandlerError(t *testing.T) {
 	dsn, cleanup := startPostgres(t)
 	defer cleanup()
