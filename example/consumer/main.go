@@ -52,7 +52,7 @@ func main() {
 			if !ok {
 				return
 			}
-			fmt.Printf("[%s] %s\n", msg.RoutingKey, msg.Body)
+			fmt.Printf("[%s] (id=%s) %s\n", msg.RoutingKey, msg.MessageId, msg.Body)
 		}
 	}
 }
