@@ -23,8 +23,16 @@ func (f *fakeSource) Next(ctx context.Context) (Message, error) {
 	return Message{}, ctx.Err()
 }
 
-func (f *fakeSource) Confirm(_ context.Context, id int64) error {
-	f.confirmed = append(f.confirmed, id)
+func (f *fakeSource) Buffered() int {
+	remaining := len(f.messages) - f.pos
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (f *fakeSource) Confirm(_ context.Context, ids ...int64) error {
+	f.confirmed = append(f.confirmed, ids...)
 	return nil
 }
 
@@ -33,18 +41,7 @@ func (f *fakeSource) Close(_ context.Context) {}
 func startRelayWithFakeSource(ctx context.Context, src *fakeSource, handler Handler, cfg Config) error {
 	cfg.setDefaults()
 	r := &Relay{handler: handler, cfg: cfg}
-	for {
-		msg, err := src.Next(ctx)
-		if err != nil {
-			return err
-		}
-		if err := r.deliverWithRetry(ctx, msg, src); err != nil {
-			return err
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-	}
+	return r.run(ctx, src)
 }
 
 func TestRelay_DeliversMessage(t *testing.T) {

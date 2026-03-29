@@ -74,15 +74,31 @@ func (r *Relay) Start(ctx context.Context) error {
 	}
 	defer src.Close(ctx)
 
+	return r.run(ctx, src)
+}
+
+func (r *Relay) run(ctx context.Context, src source) error {
+	var pendingConfirm []int64
+
 	for {
 		msg, err := src.Next(ctx)
 		if err != nil {
 			return err
 		}
+
 		slog.Info("outbox: message received", "id", msg.ID, "topic", msg.Topic)
 
-		if err := r.deliverWithRetry(ctx, msg, src); err != nil {
+		if err := r.deliverWithRetry(ctx, msg); err != nil {
 			return err
+		}
+
+		pendingConfirm = append(pendingConfirm, msg.ID)
+
+		if src.Buffered() == 0 {
+			if err := src.Confirm(ctx, pendingConfirm...); err != nil {
+				return err
+			}
+			pendingConfirm = nil
 		}
 
 		if ctx.Err() != nil {
@@ -91,7 +107,7 @@ func (r *Relay) Start(ctx context.Context) error {
 	}
 }
 
-func (r *Relay) deliverWithRetry(ctx context.Context, msg Message, src source) error {
+func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 	delay := r.cfg.RetryDelay
 	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
@@ -113,9 +129,6 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message, src source) e
 			continue
 		}
 
-		if err := src.Confirm(ctx, msg.ID); err != nil {
-			return err
-		}
 		slog.Info("outbox: message delivered", "id", msg.ID, "topic", msg.Topic)
 		return nil
 	}
