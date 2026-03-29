@@ -1,0 +1,101 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_DB: demo
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  init-db:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: demo
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        psql -h postgres -U demo -d demo -c "
+          CREATE TABLE IF NOT EXISTS outbox (
+              id         BIGSERIAL PRIMARY KEY,
+              topic      TEXT NOT NULL,
+              payload    BYTEA NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          );
+        " && psql -h postgres -U demo -d demo -c "CREATE PUBLICATION outbox_pub FOR TABLE outbox" 2>/dev/null; true
+
+  relay-1:
+    build:
+      context: ..
+      dockerfile: example/Dockerfile
+      target: multiple-relays
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://demo:demo@postgres:5432/demo
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RELAY_NAME: relay-1
+      SLOT_NAME: outbox_relay
+    restart: on-failure
+
+  relay-2:
+    build:
+      context: ..
+      dockerfile: example/Dockerfile
+      target: multiple-relays
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://demo:demo@postgres:5432/demo
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RELAY_NAME: relay-2
+      SLOT_NAME: outbox_relay
+    restart: on-failure
+
+  producer:
+    build:
+      context: ..
+      dockerfile: example/Dockerfile
+      target: producer
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://demo:demo@postgres:5432/demo
+
+  consumer:
+    build:
+      context: ..
+      dockerfile: example/Dockerfile
+      target: consumer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
