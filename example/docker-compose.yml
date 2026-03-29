@@ -42,7 +42,7 @@ services:
               payload    BYTEA NOT NULL,
               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
           );
-        " && psql -h postgres -U demo -d demo -c "CREATE PUBLICATION outbox_pub FOR TABLE outbox" 2>/dev/null; true
+        " && psql -h postgres -U demo -d demo -c "CREATE PUBLICATION outbox_pub FOR TABLE outbox WITH (publish = 'insert')" 2>/dev/null; true
 
   relay-1:
     build:
