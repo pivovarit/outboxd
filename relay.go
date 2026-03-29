@@ -30,6 +30,7 @@ type Config struct {
 	Publications []string
 	RetryDelay   time.Duration
 	Schema       SchemaConfig
+	Logger       *slog.Logger
 }
 
 func (c *Config) setDefaults() {
@@ -53,6 +54,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.Schema.CreatedAtColumn == "" {
 		c.Schema.CreatedAtColumn = "created_at"
+	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
 	}
 }
 
@@ -86,7 +90,7 @@ func (r *Relay) run(ctx context.Context, src source) error {
 			return err
 		}
 
-		slog.Info("outbox: message received", "id", msg.ID, "topic", msg.Topic)
+		r.cfg.Logger.Info("outbox: message received", "id", msg.ID, "topic", msg.Topic)
 
 		if err := r.deliverWithRetry(ctx, msg); err != nil {
 			return err
@@ -115,7 +119,7 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 		}
 
 		if err := r.handler(ctx, msg); err != nil {
-			slog.Error("outbox: handler error",
+			r.cfg.Logger.Error("outbox: handler error",
 				"id", msg.ID, "attempt", attempt, "err", err, "retry_in", delay)
 			select {
 			case <-ctx.Done():
@@ -129,7 +133,7 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 			continue
 		}
 
-		slog.Info("outbox: message delivered", "id", msg.ID, "topic", msg.Topic)
+		r.cfg.Logger.Info("outbox: message delivered", "id", msg.ID, "topic", msg.Topic)
 		return nil
 	}
 }
