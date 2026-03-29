@@ -29,6 +29,8 @@ type Config struct {
 	SlotName     string
 	Publications []string
 	RetryDelay   time.Duration
+	MaxRetries   int
+	OnDropped    func(msg Message, err error)
 	Schema       SchemaConfig
 	Logger       *slog.Logger
 }
@@ -136,6 +138,14 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 		}
 
 		if err := r.handler(ctx, msg); err != nil {
+			if r.cfg.MaxRetries > 0 && attempt >= r.cfg.MaxRetries {
+				r.cfg.Logger.Error("outbox: message dropped",
+					"id", msg.ID, "attempts", attempt, "err", err)
+				if r.cfg.OnDropped != nil {
+					r.cfg.OnDropped(msg, err)
+				}
+				return nil
+			}
 			r.cfg.Logger.Error("outbox: handler error",
 				"id", msg.ID, "attempt", attempt, "err", err, "retry_in", delay)
 			select {
