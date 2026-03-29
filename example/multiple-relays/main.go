@@ -9,7 +9,7 @@ import (
 	"os/signal"
 	"time"
 
-	outbox "github.com/pivovarit/outboxd"
+	"github.com/pivovarit/outboxd"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -36,8 +36,8 @@ func main() {
 		log.Fatalf("[%s] exchange declare failed: %v", name, err)
 	}
 
-	relay := outbox.New(os.Getenv("DATABASE_URL"),
-		func(ctx context.Context, msg outbox.Message) error {
+	relay := outboxd.New(os.Getenv("DATABASE_URL"),
+		func(ctx context.Context, msg outboxd.Message) error {
 			fmt.Printf("[%s] delivering message id=%d topic=%s payload=%s\n", name, msg.ID, msg.Topic, msg.Payload)
 			return ch.PublishWithContext(ctx, "outbox", msg.Topic, false, false, amqp.Publishing{
 				ContentType: "application/json",
@@ -45,7 +45,7 @@ func main() {
 				MessageId:   fmt.Sprintf("%d", msg.ID),
 				Timestamp:   msg.CreatedAt,
 			})
-		}, outbox.Config{
+		}, outboxd.Config{
 			SlotName:     slotName,
 			Publications: []string{"outbox_pub"},
 			RetryDelay:   time.Second,
