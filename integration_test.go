@@ -413,6 +413,20 @@ func TestIntegration_DeliversAllMessagesFromSingleTransaction(t *testing.T) {
 			t.Errorf("message[%d]: want id %d, got %d", i, want, receivedIDs[i])
 		}
 	}
+
+	verifyCtx := context.Background()
+	conn, err := pgx.Connect(verifyCtx, dsn)
+	if err != nil {
+		t.Fatalf("verify connect: %v", err)
+	}
+	defer conn.Close(verifyCtx)
+	var count int
+	if err := conn.QueryRow(verifyCtx, "SELECT COUNT(*) FROM outbox").Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected outbox to be empty after delivery, got %d rows", count)
+	}
 }
 
 func TestIntegration_RetriesOnHandlerError(t *testing.T) {
