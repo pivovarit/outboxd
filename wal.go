@@ -179,7 +179,7 @@ func (w *walListener) Next(ctx context.Context) (Message, error) {
 	}
 }
 
-func (w *walListener) Buffered() int {
+func (w *walListener) Remaining() int {
 	return len(w.buffered)
 }
 

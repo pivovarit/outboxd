@@ -23,7 +23,7 @@ func (f *fakeSource) Next(ctx context.Context) (Message, error) {
 	return Message{}, ctx.Err()
 }
 
-func (f *fakeSource) Buffered() int {
+func (f *fakeSource) Remaining() int {
 	remaining := len(f.messages) - f.pos
 	if remaining < 0 {
 		return 0
