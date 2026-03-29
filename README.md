@@ -17,14 +17,20 @@ When a service writes to the database and needs to notify other services, doing 
 
 ## Usage
 
-The only thing you need to provide is a handler - a function that takes a message and does something with it. Everything else is handled for you (retries, WAL tracking, slot management):
+The handler is just a function - return `nil` when done, return an error to retry:
 
 ```go
-relay := outbox.New(databaseURL, func(ctx context.Context, msg outbox.Message) error {
-    // msg.Topic   - e.g. "orders"
-    // msg.Payload - the raw bytes you inserted
-    // return nil when done, return an error to retry
-}, outbox.Config{
+handler := func(ctx context.Context, msg outbox.Message) error {
+    return rabbitCh.PublishWithContext(ctx, "exchange", msg.Topic, false, false,
+        amqp.Publishing{Body: msg.Payload},
+    )
+}
+```
+
+That's it. Plug it in and start relaying:
+
+```go
+relay := outbox.New(databaseURL, handler, outbox.Config{
     SlotName:     "outbox_relay",
     Publications: []string{"outbox_pub"},
 })
@@ -32,7 +38,7 @@ relay := outbox.New(databaseURL, func(ctx context.Context, msg outbox.Message) e
 relay.Start(ctx)
 ```
 
-That's it. No framework to learn, no interfaces to implement, no configuration files. Just a function.
+No framework to learn, no interfaces to implement, no configuration files. Just a function.
 
 ## Running the example
 
