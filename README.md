@@ -64,7 +64,7 @@ CREATE TABLE outbox (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE PUBLICATION outbox_pub FOR TABLE outbox;
+CREATE PUBLICATION outbox_pub FOR TABLE outbox WITH (publish = 'insert');
 ```
 
 Column names and table name are configurable via `SchemaConfig`.
