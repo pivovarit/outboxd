@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    command: ["postgres", "-c", "wal_level=logical"]
+    command: ["postgres", "-c", "wal_level=logical", "-c", "log_statement=all"]
     environment:
       POSTGRES_DB: demo
       POSTGRES_USER: demo
