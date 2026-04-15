@@ -429,6 +429,230 @@ func TestIntegration_DeliversAllMessagesFromSingleTransaction(t *testing.T) {
 	}
 }
 
+func startPostgresWithoutWAL(t *testing.T) (string, func()) {
+	t.Helper()
+	ctx := context.Background()
+
+	req := testcontainers.ContainerRequest{
+		Image: "postgres:16-alpine",
+		Env: map[string]string{
+			"POSTGRES_DB":       "testdb",
+			"POSTGRES_USER":     "test",
+			"POSTGRES_PASSWORD": "test",
+		},
+		ExposedPorts: []string{"5432/tcp"},
+		WaitingFor: wait.ForLog("database system is ready to accept connections").
+			WithOccurrence(2).
+			WithStartupTimeout(30 * time.Second),
+	}
+	ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	})
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+
+	host, err := ctr.Host(ctx)
+	if err != nil {
+		t.Fatalf("get host: %v", err)
+	}
+	port, err := ctr.MappedPort(ctx, "5432")
+	if err != nil {
+		t.Fatalf("get port: %v", err)
+	}
+
+	dsn := fmt.Sprintf("postgres://test:test@%s:%s/testdb", host, port.Port())
+	return dsn, func() { _ = ctr.Terminate(ctx) }
+}
+
+func setupOutboxPolling(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id         BIGSERIAL PRIMARY KEY,
+			topic      TEXT NOT NULL,
+			payload    BYTEA NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+}
+
+func TestIntegration_Polling_DeliversInOrder(t *testing.T) {
+	dsn, cleanup := startPostgresWithoutWAL(t)
+	defer cleanup()
+	setupOutboxPolling(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu          sync.Mutex
+		receivedIDs []int64
+		done        = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		receivedIDs = append(receivedIDs, msg.ID)
+		n := len(receivedIDs)
+		mu.Unlock()
+		if n == 3 {
+			close(done)
+		}
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		RetryDelay: 10 * time.Millisecond,
+		Polling:    &outboxd.PollingConfig{PollInterval: 100 * time.Millisecond},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() {
+		relayErr <- relay.Start(ctx)
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	insertedIDs := insertRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(receivedIDs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(receivedIDs))
+	}
+	for i, want := range insertedIDs {
+		if receivedIDs[i] != want {
+			t.Errorf("message[%d]: want id %d, got %d", i, want, receivedIDs[i])
+		}
+	}
+
+	verifyCtx := context.Background()
+	conn, err := pgx.Connect(verifyCtx, dsn)
+	if err != nil {
+		t.Fatalf("verify connect: %v", err)
+	}
+	defer conn.Close(verifyCtx)
+	var count int
+	if err := conn.QueryRow(verifyCtx, "SELECT COUNT(*) FROM outbox").Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected outbox to be empty after delivery, got %d rows", count)
+	}
+}
+
+func setupOutboxWithNotify(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id         BIGSERIAL PRIMARY KEY,
+			topic      TEXT NOT NULL,
+			payload    BYTEA NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE OR REPLACE FUNCTION outbox_notify() RETURNS trigger AS $$
+		BEGIN PERFORM pg_notify('outbox_events', ''); RETURN NEW; END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER outbox_after_insert AFTER INSERT ON outbox
+		FOR EACH ROW EXECUTE FUNCTION outbox_notify();
+	`)
+	if err != nil {
+		t.Fatalf("create table and trigger: %v", err)
+	}
+}
+
+func TestIntegration_Polling_PgNotify(t *testing.T) {
+	dsn, cleanup := startPostgresWithoutWAL(t)
+	defer cleanup()
+	setupOutboxWithNotify(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu          sync.Mutex
+		receivedIDs []int64
+		done        = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		receivedIDs = append(receivedIDs, msg.ID)
+		n := len(receivedIDs)
+		mu.Unlock()
+		if n == 3 {
+			close(done)
+		}
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		RetryDelay: 10 * time.Millisecond,
+		Polling: &outboxd.PollingConfig{
+			PollInterval:  10 * time.Second,
+			NotifyChannel: "outbox_events",
+		},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() {
+		relayErr <- relay.Start(ctx)
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	insertedIDs := insertRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+		t.Fatal("timed out: pg_notify did not wake the poller (poll interval is 10s, test timeout is 30s)")
+	}
+
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(receivedIDs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(receivedIDs))
+	}
+	for i, want := range insertedIDs {
+		if receivedIDs[i] != want {
+			t.Errorf("message[%d]: want id %d, got %d", i, want, receivedIDs[i])
+		}
+	}
+}
+
 func TestIntegration_RetriesOnHandlerError(t *testing.T) {
 	dsn, cleanup := startPostgres(t)
 	defer cleanup()
