@@ -25,6 +25,12 @@ type SchemaConfig struct {
 	CreatedAtColumn string
 }
 
+type PollingConfig struct {
+	PollInterval  time.Duration
+	BatchSize     int
+	NotifyChannel string
+}
+
 type Config struct {
 	SlotName     string
 	Publications []string
@@ -33,6 +39,7 @@ type Config struct {
 	OnDropped    func(msg Message, err error)
 	Schema       SchemaConfig
 	Logger       *slog.Logger
+	Polling      *PollingConfig
 }
 
 func (c *Config) setDefaults() {
@@ -60,6 +67,14 @@ func (c *Config) setDefaults() {
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
+	if c.Polling != nil {
+		if c.Polling.PollInterval == 0 {
+			c.Polling.PollInterval = time.Second
+		}
+		if c.Polling.BatchSize == 0 {
+			c.Polling.BatchSize = 100
+		}
+	}
 }
 
 type Relay struct {
@@ -76,7 +91,13 @@ func New(dsn string, handler Handler, cfg Config) *Relay {
 func (r *Relay) Start(ctx context.Context) error {
 	delay := r.cfg.RetryDelay
 	for {
-		src, err := newWALListener(ctx, r.dsn, r.cfg)
+		var src source
+		var err error
+		if r.cfg.Polling != nil {
+			src, err = newPollSource(ctx, r.dsn, r.cfg)
+		} else {
+			src, err = newWALListener(ctx, r.dsn, r.cfg)
+		}
 		if err == nil {
 			delay = r.cfg.RetryDelay
 			err = r.run(ctx, src)
