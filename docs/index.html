@@ -1073,7 +1073,7 @@
       <div class="how-step reveal reveal-delay-2">
         <div class="how-num"></div>
         <h3 class="how-title">Stream</h3>
-        <p class="how-desc"><code>outboxd</code> picks up the INSERT via a PostgreSQL logical replication slot in real time.</p>
+        <p class="how-desc"><code>outboxd</code> picks up the INSERT via a PostgreSQL logical replication slot in real time, or through polling with optional <code>pg_notify</code> acceleration.</p>
       </div>
 
       <div class="how-step reveal reveal-delay-3">
@@ -1147,6 +1147,14 @@
         </div>
         <h3 class="feature-title">Graceful Reconnection</h3>
         <p class="feature-desc">Exponential backoff on connection loss. The relay reconnects automatically without losing messages or duplicating deliveries.</p>
+      </div>
+
+      <div class="feature-card reveal reveal-delay-1">
+        <div class="feature-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </div>
+        <h3 class="feature-title">Polling Fallback</h3>
+        <p class="feature-desc">No logical replication? No problem. Fall back to polling with optional <code>pg_notify</code> acceleration for near-real-time delivery without WAL access.</p>
       </div>
     </div>
   </div>
