@@ -6,7 +6,7 @@ A lightweight low-latency outbox event relay powered by PostgreSQL logical repli
 
 When a service writes to the database and needs to notify other services, doing both in a single transaction is impossible (dual-write problem). The [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html) solves this by writing events to an outbox table within the same transaction, then relaying them to a message broker separately.
 
-`outboxd` handles the relay part - it listens for changes via a replication slot and delivers messages to a handler you provide as soon as they're committed. The handler is just a Go function anyone can implement. Everything else (WAL streaming, replication slot management, retries, cleanup) is taken care of. No external infrastructure beyond PostgreSQL, no JVM.
+`outboxd` handles the relay part - it listens for changes via a replication slot and delivers messages to a handler you provide as soon as they're committed. When logical replication is not available, it can fall back to a polling-based strategy with optional `pg_notify` acceleration. The handler is just a Go function anyone can implement. Everything else (WAL streaming, replication slot management, retries, cleanup) is taken care of. No external infrastructure beyond PostgreSQL, no JVM.
 
 ## How it works
 
@@ -68,3 +68,44 @@ CREATE PUBLICATION outbox_pub FOR TABLE outbox WITH (publish = 'insert');
 ```
 
 Column names and table name are configurable via `SchemaConfig`.
+
+## Polling mode
+
+If logical replication is not available (e.g. managed PostgreSQL without `wal_level=logical`, restricted permissions, or shared hosting), `outboxd` can fall back to a polling-based strategy. Enable it by providing a `PollingConfig`:
+
+```go
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    Polling: &outboxd.PollingConfig{
+        PollInterval: 500 * time.Millisecond,
+        BatchSize:    100,
+    },
+})
+```
+
+In polling mode, `outboxd` periodically queries the outbox table for new rows, delivers them through the handler, and deletes processed rows. An advisory lock ensures only one relay instance processes messages at a time.
+
+### NOTIFY-accelerated polling
+
+For near-real-time delivery without logical replication, combine polling with PostgreSQL `NOTIFY`. Set `NotifyChannel` and create a trigger on the outbox table:
+
+```sql
+CREATE OR REPLACE FUNCTION outbox_notify() RETURNS trigger AS $$
+BEGIN PERFORM pg_notify('outbox_events', ''); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER outbox_notify_trigger
+    AFTER INSERT ON outbox
+    FOR EACH ROW EXECUTE FUNCTION outbox_notify();
+```
+
+```go
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    Polling: &outboxd.PollingConfig{
+        PollInterval:  10 * time.Second,
+        BatchSize:     100,
+        NotifyChannel: "outbox_events",
+    },
+})
+```
+
+The relay listens on the channel and wakes up immediately on new inserts. The poll interval acts as a safety net in case a notification is missed.
