@@ -1,6 +1,6 @@
 module github.com/pivovarit/outboxd/middleware/otel
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/pivovarit/outboxd v0.0.0

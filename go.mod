@@ -1,6 +1,6 @@
 module github.com/pivovarit/outboxd
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/jackc/pglogrepl v0.0.0-20251213150135-2e8d0df862c1
