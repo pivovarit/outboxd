@@ -17,6 +17,11 @@ type Message struct {
 
 type Handler func(ctx context.Context, msg Message) error
 
+// Middleware wraps a Handler and returns a new Handler. It is used to compose
+// cross-cutting concerns (panic recovery, logging, metrics, tracing) around
+// the user's handler without changing its signature.
+type Middleware func(Handler) Handler
+
 type SchemaConfig struct {
 	Table           string
 	IDColumn        string
@@ -40,6 +45,11 @@ type Config struct {
 	Schema       SchemaConfig
 	Logger       *slog.Logger
 	Polling      *PollingConfig
+	// Middlewares wrap the user handler in the order given. The first element
+	// is outermost: it is entered first and exits last. Retry is applied by
+	// the relay outside the chain, so each retry attempt flows through every
+	// middleware. A nil or empty slice disables middleware entirely.
+	Middlewares []Middleware
 }
 
 func (c *Config) setDefaults() {
@@ -85,7 +95,7 @@ type Relay struct {
 
 func New(dsn string, handler Handler, cfg Config) *Relay {
 	cfg.setDefaults()
-	return &Relay{dsn: dsn, handler: handler, cfg: cfg}
+	return &Relay{dsn: dsn, handler: wrap(handler, cfg.Middlewares), cfg: cfg}
 }
 
 func (r *Relay) Start(ctx context.Context) error {
@@ -184,4 +194,13 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 		r.cfg.Logger.Info("outbox: message delivered", "id", msg.ID, "topic", msg.Topic)
 		return nil
 	}
+}
+
+// wrap composes mws around h so that mws[0] is the outermost wrapper.
+// Calling wrap(h, nil) or wrap(h, []Middleware{}) returns h unchanged.
+func wrap(h Handler, mws []Middleware) Handler {
+	for i := len(mws) - 1; i >= 0; i-- {
+		h = mws[i](h)
+	}
+	return h
 }
