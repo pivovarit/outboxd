@@ -40,6 +40,54 @@ relay.Start(ctx)
 
 No framework to learn, no interfaces to implement, no configuration files. Just a function.
 
+## Middleware
+
+Cross-cutting concerns like panic recovery, logging, metrics, tracing can be composed
+around your handler via `Config.Middlewares`. 
+
+A middleware is just a function:
+
+```go
+type Middleware func(Handler) Handler
+```
+
+The first entry in `Middlewares` is **outermost**: it is entered first and exits last. Retry is applied by the relay *outside* the middleware chain, so every
+middleware observes each retry attempt.
+
+`outboxd` ships one stock middleware - `Recover()` - which catches handler
+panics and converts them to errors, letting the normal retry/drop path handle
+them instead of crashing the relay:
+
+```go
+import (
+    "github.com/pivovarit/outboxd"
+    "github.com/pivovarit/outboxd/middleware"
+)
+
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    SlotName:     "outbox_relay",
+    Publications: []string{"outbox_pub"},
+    Middlewares: []outboxd.Middleware{
+        middleware.Recover(), // place first so it also catches panics from later middleware
+    },
+})
+```
+
+`Recover()` is safe but not additive - registering it more than once does nothing useful: the innermost instance converts the panic to an error, and outer instances see a normal return.
+
+Writing your own middleware is equally simple - any function matching the `Middleware` signature works:
+
+```go
+logging := func(next outboxd.Handler) outboxd.Handler {
+    return func(ctx context.Context, msg outboxd.Message) error {
+        start := time.Now()
+        err := next(ctx, msg)
+        log.Printf("delivered id=%d topic=%s took=%s err=%v", msg.ID, msg.Topic, time.Since(start), err)
+        return err
+    }
+}
+```
+
 ## Running the example
 
 Try it with a single command:

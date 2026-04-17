@@ -40,7 +40,7 @@ func (f *fakeSource) Close(_ context.Context) {}
 
 func startRelayWithFakeSource(ctx context.Context, src *fakeSource, handler Handler, cfg Config) error {
 	cfg.setDefaults()
-	r := &Relay{handler: handler, cfg: cfg}
+	r := &Relay{handler: wrap(handler, cfg.Middlewares), cfg: cfg}
 	return r.run(ctx, src)
 }
 
@@ -195,3 +195,169 @@ func TestRelay_StopsOnContextCancel(t *testing.T) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
+
+func TestRelay_MiddlewareIsInvoked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var mwCalls int
+	mw := func(next Handler) Handler {
+		return func(ctx context.Context, msg Message) error {
+			mwCalls++
+			return next(ctx, msg)
+		}
+	}
+
+	handler := func(_ context.Context, _ Message) error {
+		cancel()
+		return nil
+	}
+
+	src := &fakeSource{
+		messages: []Message{{ID: 1, Topic: "t", Payload: []byte("p")}},
+	}
+
+	cfg := Config{
+		RetryDelay:  time.Millisecond,
+		Middlewares: []Middleware{mw},
+	}
+
+	err := startRelayWithFakeSource(ctx, src, handler, cfg)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if mwCalls != 1 {
+		t.Errorf("expected middleware invoked once, got %d", mwCalls)
+	}
+}
+
+func TestRelay_MiddlewareAppliedInOrder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var trace []string
+	makeMW := func(name string) Middleware {
+		return func(next Handler) Handler {
+			return func(ctx context.Context, msg Message) error {
+				trace = append(trace, name+"-in")
+				err := next(ctx, msg)
+				trace = append(trace, name+"-out")
+				return err
+			}
+		}
+	}
+
+	handler := func(_ context.Context, _ Message) error {
+		trace = append(trace, "handler")
+		cancel()
+		return nil
+	}
+
+	src := &fakeSource{messages: []Message{{ID: 1}}}
+
+	cfg := Config{
+		RetryDelay:  time.Millisecond,
+		Middlewares: []Middleware{makeMW("A"), makeMW("B"), makeMW("C")},
+	}
+
+	_ = startRelayWithFakeSource(ctx, src, handler, cfg)
+
+	want := []string{"A-in", "B-in", "C-in", "handler", "C-out", "B-out", "A-out"}
+	if len(trace) != len(want) {
+		t.Fatalf("trace length mismatch: got %v, want %v", trace, want)
+	}
+	for i := range want {
+		if trace[i] != want[i] {
+			t.Errorf("trace[%d]: got %q, want %q", i, trace[i], want[i])
+		}
+	}
+}
+
+func TestRelay_MiddlewareSeesEachRetryAttempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var mwCalls int
+	mw := func(next Handler) Handler {
+		return func(ctx context.Context, msg Message) error {
+			mwCalls++
+			return next(ctx, msg)
+		}
+	}
+
+	attempts := 0
+	handler := func(_ context.Context, _ Message) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("transient")
+		}
+		cancel()
+		return nil
+	}
+
+	src := &fakeSource{messages: []Message{{ID: 1}}}
+
+	cfg := Config{
+		RetryDelay:  time.Millisecond,
+		Middlewares: []Middleware{mw},
+	}
+
+	_ = startRelayWithFakeSource(ctx, src, handler, cfg)
+
+	if mwCalls != 3 {
+		t.Errorf("expected middleware invoked 3 times (once per attempt), got %d", mwCalls)
+	}
+}
+
+func TestRelay_NilMiddlewaresBehavesIdentically(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var received []Message
+	handler := func(_ context.Context, msg Message) error {
+		received = append(received, msg)
+		cancel()
+		return nil
+	}
+
+	src := &fakeSource{messages: []Message{{ID: 1, Topic: "t", Payload: []byte("p")}}}
+
+	// Middlewares explicitly nil.
+	err := startRelayWithFakeSource(ctx, src, handler, Config{
+		RetryDelay:  time.Millisecond,
+		Middlewares: nil,
+	})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if len(received) != 1 || received[0].ID != 1 {
+		t.Errorf("expected single message id 1, got %v", received)
+	}
+	if len(src.confirmed) != 1 || src.confirmed[0] != 1 {
+		t.Errorf("expected id 1 confirmed, got %v", src.confirmed)
+	}
+}
+
+func benchmarkWrap(b *testing.B, n int) {
+	mws := make([]Middleware, n)
+	for i := range mws {
+		mws[i] = func(next Handler) Handler {
+			return func(ctx context.Context, msg Message) error {
+				return next(ctx, msg)
+			}
+		}
+	}
+	handler := func(_ context.Context, _ Message) error { return nil }
+	ctx := context.Background()
+	msg := Message{ID: 1}
+
+	wrapped := wrap(handler, mws)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = wrapped(ctx, msg)
+	}
+}
+
+func BenchmarkWrap_None(b *testing.B) { benchmarkWrap(b, 0) }
+func BenchmarkWrap_One(b *testing.B)  { benchmarkWrap(b, 1) }
+func BenchmarkWrap_Five(b *testing.B) { benchmarkWrap(b, 5) }
