@@ -881,6 +881,95 @@ func TestIntegration_WAL_StandbyHeartbeatDuringSlowHandler(t *testing.T) {
 	shutdown()
 }
 
+func TestIntegration_WAL_HeartbeatDuringBackpressuredConsumer(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+	setupOutbox(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const slot = "test_slot_heartbeat_backpressured_consumer"
+	const keepalive = 300 * time.Millisecond
+
+	var delivered atomic.Int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	handler := func(hctx context.Context, _ outboxd.Message) error {
+		if delivered.Add(1) == 1 {
+			entered <- struct{}{}
+			select {
+			case <-release:
+			case <-hctx.Done():
+			}
+		}
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		SlotName:          slot,
+		Publications:      []string{"outbox_pub"},
+		RetryDelay:        10 * time.Millisecond,
+		KeepaliveInterval: keepalive,
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	shutdown := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		cancel()
+		<-relayErr
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	insertRows(t, dsn, 1)
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		shutdown()
+		t.Fatal("first handler invocation never happened")
+	}
+
+	insertRows(t, dsn, 1)
+	time.Sleep(500 * time.Millisecond)
+
+	insertRows(t, dsn, 1)
+
+	var t0 time.Time
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if rt, ok := readReplyTime(t, dsn, slot); ok {
+			t0 = rt
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if t0.IsZero() {
+		shutdown()
+		t.Fatal("reply_time unavailable while consumer backpressured")
+	}
+
+	time.Sleep(keepalive * 4)
+
+	t1, ok := readReplyTime(t, dsn, slot)
+	if !ok {
+		shutdown()
+		t.Fatal("reply_time disappeared while consumer backpressured")
+	}
+	if !t1.After(t0) {
+		shutdown()
+		t.Fatalf("reply_time did not advance with backpressured consumer (heartbeat starved): t0=%s t1=%s", t0, t1)
+	}
+
+	shutdown()
+}
+
 func TestIntegration_Polling_ConfirmBetweenFetchesWithBatchSize1(t *testing.T) {
 	dsn, cleanup := startPostgresWithoutWAL(t)
 	defer cleanup()
@@ -999,7 +1088,7 @@ func TestIntegration_Polling_RowsDeletedAtEndOfBuffer(t *testing.T) {
 
 	relay := outboxd.New(dsn, handler, outboxd.Config{
 		RetryDelay:        10 * time.Millisecond,
-		KeepaliveInterval: time.Hour, // isolate confirm to Remaining==0 path, not ticker
+		KeepaliveInterval: time.Hour,
 		Polling: &outboxd.PollingConfig{
 			PollInterval: 50 * time.Millisecond,
 			BatchSize:    3,
@@ -1021,7 +1110,6 @@ func TestIntegration_Polling_RowsDeletedAtEndOfBuffer(t *testing.T) {
 		t.Fatalf("timed out waiting for 5 deliveries, got %d", len(received))
 	}
 
-	// Let the final flush complete.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if countRows() == 0 {
@@ -1072,7 +1160,7 @@ func TestIntegration_FlushOnContextCancel(t *testing.T) {
 		SlotName:          "test_slot_flush_cancel",
 		Publications:      []string{"outbox_pub"},
 		RetryDelay:        10 * time.Millisecond,
-		KeepaliveInterval: time.Hour, // prevent ticker from doing the work
+		KeepaliveInterval: time.Hour,
 	})
 
 	relayErr := make(chan error, 1)
