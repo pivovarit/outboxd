@@ -142,22 +142,27 @@ func (r *Relay) Start(ctx context.Context) error {
 	}
 }
 
+type nextResult struct {
+	msg       Message
+	remaining int
+}
+
 func (r *Relay) run(ctx context.Context, src source) error {
 	subCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	msgCh := make(chan Message)
+	msgCh := make(chan nextResult)
 	nextErrCh := make(chan error, 1)
 
 	go func() {
 		for {
-			msg, err := src.Next(subCtx)
+			msg, remaining, err := src.Next(subCtx)
 			if err != nil {
 				nextErrCh <- err
 				return
 			}
 			select {
-			case msgCh <- msg:
+			case msgCh <- nextResult{msg: msg, remaining: remaining}:
 			case <-subCtx.Done():
 				return
 			}
@@ -195,13 +200,13 @@ func (r *Relay) run(ctx context.Context, src source) error {
 		select {
 		case err := <-nextErrCh:
 			return err
-		case msg := <-msgCh:
-			r.cfg.Logger.Info("outbox: message received", "id", msg.ID, "topic", msg.Topic)
-			if err := r.deliverWithRetry(ctx, msg); err != nil {
+		case nr := <-msgCh:
+			r.cfg.Logger.Info("outbox: message received", "id", nr.msg.ID, "topic", nr.msg.Topic)
+			if err := r.deliverWithRetry(ctx, nr.msg); err != nil {
 				return err
 			}
-			pending = append(pending, msg.ID)
-			if src.Remaining() == 0 {
+			pending = append(pending, nr.msg.ID)
+			if nr.remaining == 0 {
 				fCtx, fCancel := context.WithTimeout(context.Background(), flushTimeout)
 				err := flush(fCtx)
 				fCancel()

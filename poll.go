@@ -80,25 +80,25 @@ func newPollSource(ctx context.Context, dsn string, cfg Config) (*pollSource, er
 	}, nil
 }
 
-func (p *pollSource) Next(ctx context.Context) (Message, error) {
+func (p *pollSource) Next(ctx context.Context) (Message, int, error) {
 	for {
 		if len(p.buffered) > 0 {
 			msg := p.buffered[0]
 			p.buffered = p.buffered[1:]
-			return msg, nil
+			return msg, len(p.buffered), nil
 		}
 
 		if p.batchInFlight.Load() > 0 {
 			select {
 			case <-p.confirmCh:
 			case <-ctx.Done():
-				return Message{}, ctx.Err()
+				return Message{}, 0, ctx.Err()
 			}
 		}
 
 		rows, err := p.conn.Query(ctx, p.selectQuery, p.batchSize)
 		if err != nil {
-			return Message{}, fmt.Errorf("outbox: poll query: %w", err)
+			return Message{}, 0, fmt.Errorf("outbox: poll query: %w", err)
 		}
 
 		var messages []Message
@@ -106,21 +106,22 @@ func (p *pollSource) Next(ctx context.Context) (Message, error) {
 			var msg Message
 			if err := rows.Scan(&msg.ID, &msg.Topic, &msg.Payload, &msg.CreatedAt); err != nil {
 				rows.Close()
-				return Message{}, fmt.Errorf("outbox: poll scan: %w", err)
+				return Message{}, 0, fmt.Errorf("outbox: poll scan: %w", err)
 			}
 			messages = append(messages, msg)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return Message{}, fmt.Errorf("outbox: poll rows: %w", err)
+			return Message{}, 0, fmt.Errorf("outbox: poll rows: %w", err)
 		}
 
 		if len(messages) > 0 {
-			return p.armBatch(messages), nil
+			msg := p.armBatch(messages)
+			return msg, len(p.buffered), nil
 		}
 
 		if err := p.waitForActivity(ctx); err != nil {
-			return Message{}, err
+			return Message{}, 0, err
 		}
 	}
 }
@@ -159,10 +160,6 @@ func (p *pollSource) armBatch(messages []Message) Message {
 	p.buffered = messages[1:]
 	p.batchInFlight.Store(int32(len(messages)))
 	return messages[0]
-}
-
-func (p *pollSource) Remaining() int {
-	return len(p.buffered)
 }
 
 func (p *pollSource) Confirm(ctx context.Context, ids ...int64) error {

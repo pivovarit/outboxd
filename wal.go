@@ -249,16 +249,16 @@ func (w *walListener) emitErr(err error) {
 	}
 }
 
-func (w *walListener) Next(ctx context.Context) (Message, error) {
+func (w *walListener) Next(ctx context.Context) (Message, int, error) {
 	if len(w.buffered) > 0 {
 		msg := w.buffered[0]
 		w.buffered = w.buffered[1:]
-		return msg, nil
+		return msg, len(w.buffered), nil
 	}
 	select {
 	case batch, ok := <-w.batchCh:
 		if !ok {
-			return Message{}, errWALClosed
+			return Message{}, 0, errWALClosed
 		}
 		w.mu.Lock()
 		w.inFlight = append(w.inFlight, inFlightBatch{lsn: batch.lsn, remaining: len(batch.messages)})
@@ -266,16 +266,12 @@ func (w *walListener) Next(ctx context.Context) (Message, error) {
 		if len(batch.messages) > 1 {
 			w.buffered = batch.messages[1:]
 		}
-		return batch.messages[0], nil
+		return batch.messages[0], len(w.buffered), nil
 	case err := <-w.errCh:
-		return Message{}, err
+		return Message{}, 0, err
 	case <-ctx.Done():
-		return Message{}, ctx.Err()
+		return Message{}, 0, ctx.Err()
 	}
-}
-
-func (w *walListener) Remaining() int {
-	return len(w.buffered)
 }
 
 func (w *walListener) Confirm(ctx context.Context, ids ...int64) error {

@@ -18,39 +18,32 @@ type fakeSource struct {
 	gate              chan struct{}
 }
 
-func (f *fakeSource) Next(ctx context.Context) (Message, error) {
+func (f *fakeSource) Next(ctx context.Context) (Message, int, error) {
 	f.mu.Lock()
 	if f.gate != nil && f.pos > 0 {
 		f.mu.Unlock()
 		select {
 		case <-f.gate:
 		case <-ctx.Done():
-			return Message{}, ctx.Err()
+			return Message{}, 0, ctx.Err()
 		}
 		f.mu.Lock()
 	}
 	if f.pos < len(f.messages) {
 		msg := f.messages[f.pos]
 		f.pos++
+		var remaining int
+		if f.remainingOverride != nil {
+			remaining = *f.remainingOverride
+		} else {
+			remaining = len(f.messages) - f.pos
+		}
 		f.mu.Unlock()
-		return msg, nil
+		return msg, remaining, nil
 	}
 	f.mu.Unlock()
 	<-ctx.Done()
-	return Message{}, ctx.Err()
-}
-
-func (f *fakeSource) Remaining() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.remainingOverride != nil {
-		return *f.remainingOverride
-	}
-	remaining := len(f.messages) - f.pos
-	if remaining < 0 {
-		return 0
-	}
-	return remaining
+	return Message{}, 0, ctx.Err()
 }
 
 func (f *fakeSource) Confirm(_ context.Context, ids ...int64) error {
