@@ -3,27 +3,49 @@ package outboxd
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
 
 type fakeSource struct {
-	messages  []Message
-	pos       int
-	confirmed []int64
+	mu                sync.Mutex
+	messages          []Message
+	pos               int
+	remainingOverride *int
+	confirmed         []int64
+	confirmCalls      int
+	gate              chan struct{}
 }
 
 func (f *fakeSource) Next(ctx context.Context) (Message, error) {
+	f.mu.Lock()
+	if f.gate != nil && f.pos > 0 {
+		f.mu.Unlock()
+		select {
+		case <-f.gate:
+		case <-ctx.Done():
+			return Message{}, ctx.Err()
+		}
+		f.mu.Lock()
+	}
 	if f.pos < len(f.messages) {
 		msg := f.messages[f.pos]
 		f.pos++
+		f.mu.Unlock()
 		return msg, nil
 	}
+	f.mu.Unlock()
 	<-ctx.Done()
 	return Message{}, ctx.Err()
 }
 
 func (f *fakeSource) Remaining() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.remainingOverride != nil {
+		return *f.remainingOverride
+	}
 	remaining := len(f.messages) - f.pos
 	if remaining < 0 {
 		return 0
@@ -32,11 +54,28 @@ func (f *fakeSource) Remaining() int {
 }
 
 func (f *fakeSource) Confirm(_ context.Context, ids ...int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.confirmed = append(f.confirmed, ids...)
+	f.confirmCalls++
 	return nil
 }
 
 func (f *fakeSource) Close(_ context.Context) {}
+
+func (f *fakeSource) confirmedSnapshot() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]int64, len(f.confirmed))
+	copy(out, f.confirmed)
+	return out
+}
+
+func (f *fakeSource) confirmCallsSnapshot() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.confirmCalls
+}
 
 func startRelayWithFakeSource(ctx context.Context, src *fakeSource, handler Handler, cfg Config) error {
 	cfg.setDefaults()
@@ -69,8 +108,9 @@ func TestRelay_DeliversMessage(t *testing.T) {
 	if received[0].ID != 1 {
 		t.Errorf("expected message id 1, got %d", received[0].ID)
 	}
-	if len(src.confirmed) != 1 || src.confirmed[0] != 1 {
-		t.Errorf("expected id 1 confirmed, got %v", src.confirmed)
+	confirmed := src.confirmedSnapshot()
+	if len(confirmed) != 1 || confirmed[0] != 1 {
+		t.Errorf("expected id 1 confirmed, got %v", confirmed)
 	}
 }
 
@@ -96,8 +136,9 @@ func TestRelay_RetriesOnHandlerError(t *testing.T) {
 	if attempts != 3 {
 		t.Errorf("expected 3 handler attempts, got %d", attempts)
 	}
-	if len(src.confirmed) != 1 || src.confirmed[0] != 42 {
-		t.Errorf("expected id 42 confirmed after retry, got %v", src.confirmed)
+	confirmed := src.confirmedSnapshot()
+	if len(confirmed) != 1 || confirmed[0] != 42 {
+		t.Errorf("expected id 42 confirmed after retry, got %v", confirmed)
 	}
 }
 
@@ -151,8 +192,9 @@ func TestRelay_DropsMessageAfterMaxRetries(t *testing.T) {
 	if droppedErr == nil || droppedErr.Error() != "permanent error" {
 		t.Errorf("expected dropped error 'permanent error', got %v", droppedErr)
 	}
-	if len(src.confirmed) != 2 {
-		t.Errorf("expected both messages confirmed, got %v", src.confirmed)
+	confirmed := src.confirmedSnapshot()
+	if len(confirmed) != 2 {
+		t.Errorf("expected both messages confirmed, got %v", confirmed)
 	}
 }
 
@@ -331,8 +373,9 @@ func TestRelay_NilMiddlewaresBehavesIdentically(t *testing.T) {
 	if len(received) != 1 || received[0].ID != 1 {
 		t.Errorf("expected single message id 1, got %v", received)
 	}
-	if len(src.confirmed) != 1 || src.confirmed[0] != 1 {
-		t.Errorf("expected id 1 confirmed, got %v", src.confirmed)
+	confirmed := src.confirmedSnapshot()
+	if len(confirmed) != 1 || confirmed[0] != 1 {
+		t.Errorf("expected id 1 confirmed, got %v", confirmed)
 	}
 }
 
@@ -361,3 +404,77 @@ func benchmarkWrap(b *testing.B, n int) {
 func BenchmarkWrap_None(b *testing.B) { benchmarkWrap(b, 0) }
 func BenchmarkWrap_One(b *testing.B)  { benchmarkWrap(b, 1) }
 func BenchmarkWrap_Five(b *testing.B) { benchmarkWrap(b, 5) }
+
+func TestConfig_KeepaliveIntervalDefault(t *testing.T) {
+	cfg := Config{}
+	cfg.setDefaults()
+	if cfg.KeepaliveInterval != 5*time.Second {
+		t.Errorf("expected KeepaliveInterval default 5s, got %v", cfg.KeepaliveInterval)
+	}
+}
+
+func TestConfig_KeepaliveIntervalPreservesExplicitValue(t *testing.T) {
+	cfg := Config{KeepaliveInterval: 250 * time.Millisecond}
+	cfg.setDefaults()
+	if cfg.KeepaliveInterval != 250*time.Millisecond {
+		t.Errorf("expected explicit KeepaliveInterval preserved, got %v", cfg.KeepaliveInterval)
+	}
+}
+
+func TestRelay_TickerConfirmsPendingMidBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	override := 1
+	src := &fakeSource{
+		messages:          []Message{{ID: 1}, {ID: 2}},
+		remainingOverride: &override,
+	}
+
+	handler := func(_ context.Context, msg Message) error {
+		if msg.ID == 2 {
+			// Let the ticker fire once before we cancel.
+			time.Sleep(60 * time.Millisecond)
+			cancel()
+		}
+		return nil
+	}
+
+	_ = startRelayWithFakeSource(ctx, src, handler, Config{
+		RetryDelay:        time.Millisecond,
+		KeepaliveInterval: 20 * time.Millisecond,
+	})
+
+	if src.confirmCallsSnapshot() < 1 {
+		t.Fatalf("expected at least 1 ticker-driven Confirm call, got %d", src.confirmCallsSnapshot())
+	}
+	confirmed := src.confirmedSnapshot()
+	if len(confirmed) < 1 {
+		t.Errorf("expected at least one id confirmed by ticker, got %v", confirmed)
+	}
+}
+
+func TestRelay_FlushesPendingOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	override := 1
+	src := &fakeSource{
+		messages:          []Message{{ID: 7}},
+		remainingOverride: &override,
+	}
+
+	handler := func(_ context.Context, _ Message) error {
+		cancel()
+		return nil
+	}
+
+	_ = startRelayWithFakeSource(ctx, src, handler, Config{
+		RetryDelay:        time.Millisecond,
+		KeepaliveInterval: time.Hour,
+	})
+
+	confirmed := src.confirmedSnapshot()
+	if len(confirmed) != 1 || confirmed[0] != 7 {
+		t.Errorf("expected id 7 flushed on context cancel, got %v", confirmed)
+	}
+}

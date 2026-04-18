@@ -2,8 +2,12 @@ package outboxd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -13,11 +17,8 @@ import (
 )
 
 type walListener struct {
-	replConn  *pgconn.PgConn
-	dbConn    *pgx.Conn
-	relations map[uint32]*pglogrepl.RelationMessage
-	typeMap   *pgtype.Map
-	lastLSN   pglogrepl.LSN
+	replConn *pgconn.PgConn
+	dbConn   *pgx.Conn
 
 	tableName       string
 	idColumn        string
@@ -26,8 +27,40 @@ type walListener struct {
 	createdAtColumn string
 	deleteQuery     string
 
+	standbyInterval time.Duration
+
+	relations map[uint32]*pglogrepl.RelationMessage
+	typeMap   *pgtype.Map
+
+	batchCh  chan walBatch
+	errCh    chan error
+	readCtx  context.Context
+	readStop context.CancelFunc
+	readDone chan struct{}
+
 	buffered []Message
+
+	mu       sync.Mutex
+	inFlight []inFlightBatch
+
+	confirmedLSN atomic.Uint64
+
+	logger interface {
+		Error(msg string, args ...any)
+	}
 }
+
+type walBatch struct {
+	messages []Message
+	lsn      pglogrepl.LSN
+}
+
+type inFlightBatch struct {
+	lsn       pglogrepl.LSN
+	remaining int
+}
+
+var errWALClosed = errors.New("outbox: wal listener closed")
 
 func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, error) {
 	replCfg, err := pgconn.ParseConfig(dsn)
@@ -84,7 +117,8 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 		pgx.Identifier{schema.Table}.Sanitize(),
 		pgx.Identifier{schema.IDColumn}.Sanitize())
 
-	return &walListener{
+	readCtx, readStop := context.WithCancel(context.Background())
+	w := &walListener{
 		replConn:        replConn,
 		dbConn:          dbConn,
 		relations:       make(map[uint32]*pglogrepl.RelationMessage),
@@ -95,30 +129,52 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 		payloadColumn:   schema.PayloadColumn,
 		createdAtColumn: schema.CreatedAtColumn,
 		deleteQuery:     deleteQuery,
-	}, nil
-}
-
-func (w *walListener) Close(ctx context.Context) {
-	_ = w.replConn.Close(ctx)
-	_ = w.dbConn.Close(ctx)
-}
-
-func (w *walListener) Next(ctx context.Context) (Message, error) {
-	if len(w.buffered) > 0 {
-		msg := w.buffered[0]
-		w.buffered = w.buffered[1:]
-		return msg, nil
+		standbyInterval: cfg.KeepaliveInterval,
+		batchCh:         make(chan walBatch),
+		errCh:           make(chan error, 1),
+		readCtx:         readCtx,
+		readStop:        readStop,
+		readDone:        make(chan struct{}),
+		logger:          cfg.Logger,
 	}
 
-	var (
-		pending []Message
-		txLSN   pglogrepl.LSN
-	)
+	go w.readLoop()
+	return w, nil
+}
+
+func (w *walListener) readLoop() {
+	defer close(w.readDone)
+
+	var pending []Message
+	var txLSN pglogrepl.LSN
+	nextStandby := time.Now().Add(w.standbyInterval)
 
 	for {
-		rawMsg, err := w.replConn.ReceiveMessage(ctx)
+		recvCtx, cancel := context.WithDeadline(w.readCtx, nextStandby)
+		rawMsg, err := w.replConn.ReceiveMessage(recvCtx)
+		cancel()
+
 		if err != nil {
-			return Message{}, fmt.Errorf("outbox: wal receive: %w", err)
+			if w.readCtx.Err() != nil {
+				return
+			}
+			if !pgconn.Timeout(err) {
+				w.emitErr(fmt.Errorf("outbox: wal receive: %w", err))
+				return
+			}
+		}
+
+		if !time.Now().Before(nextStandby) {
+			if sErr := w.sendStandbyStatus(w.readCtx); sErr != nil && w.readCtx.Err() == nil {
+				w.emitErr(fmt.Errorf("outbox: standby status update: %w", sErr))
+				return
+			}
+			nextStandby = time.Now().Add(w.standbyInterval)
+		}
+
+		if err != nil {
+			// err was pgconn.Timeout; standby (if due) has been sent. Loop.
+			continue
 		}
 
 		cd, ok := rawMsg.(*pgproto3.CopyData)
@@ -128,54 +184,93 @@ func (w *walListener) Next(ctx context.Context) (Message, error) {
 
 		switch cd.Data[0] {
 		case pglogrepl.PrimaryKeepaliveMessageByteID:
-			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(cd.Data[1:])
-			if err != nil {
-				return Message{}, fmt.Errorf("outbox: parse keepalive: %w", err)
+			pkm, pErr := pglogrepl.ParsePrimaryKeepaliveMessage(cd.Data[1:])
+			if pErr != nil {
+				w.emitErr(fmt.Errorf("outbox: parse keepalive: %w", pErr))
+				return
 			}
 			if pkm.ReplyRequested {
-				if err := w.sendStandbyStatus(ctx); err != nil {
-					return Message{}, err
+				if sErr := w.sendStandbyStatus(w.readCtx); sErr != nil && w.readCtx.Err() == nil {
+					w.emitErr(fmt.Errorf("outbox: standby reply: %w", sErr))
+					return
 				}
+				nextStandby = time.Now().Add(w.standbyInterval)
 			}
 
 		case pglogrepl.XLogDataByteID:
-			xld, err := pglogrepl.ParseXLogData(cd.Data[1:])
-			if err != nil {
-				return Message{}, fmt.Errorf("outbox: parse xlogdata: %w", err)
+			xld, pErr := pglogrepl.ParseXLogData(cd.Data[1:])
+			if pErr != nil {
+				w.emitErr(fmt.Errorf("outbox: parse xlogdata: %w", pErr))
+				return
 			}
-
-			logicalMsg, err := pglogrepl.Parse(xld.WALData)
-			if err != nil {
-				return Message{}, fmt.Errorf("outbox: parse logical msg: %w", err)
+			logicalMsg, pErr := pglogrepl.Parse(xld.WALData)
+			if pErr != nil {
+				w.emitErr(fmt.Errorf("outbox: parse logical msg: %w", pErr))
+				return
 			}
 
 			switch m := logicalMsg.(type) {
 			case *pglogrepl.BeginMessage:
 				txLSN = m.FinalLSN
 				pending = nil
-
 			case *pglogrepl.RelationMessage:
 				w.relations[m.RelationID] = m
-
 			case *pglogrepl.InsertMessage:
-				rel, ok := w.relations[m.RelationID]
-				if !ok || rel.RelationName != w.tableName {
+				rel, rOK := w.relations[m.RelationID]
+				if !rOK || rel.RelationName != w.tableName {
 					continue
 				}
-				msg, err := w.decodeInsert(rel, m.Tuple)
-				if err != nil {
-					return Message{}, err
+				decoded, dErr := w.decodeInsert(rel, m.Tuple)
+				if dErr != nil {
+					w.emitErr(dErr)
+					return
 				}
-				pending = append(pending, msg)
-
+				pending = append(pending, decoded)
 			case *pglogrepl.CommitMessage:
-				if len(pending) > 0 {
-					w.lastLSN = txLSN
-					w.buffered = pending[1:]
-					return pending[0], nil
+				if len(pending) == 0 {
+					continue
 				}
+				batch := walBatch{messages: pending, lsn: txLSN}
+				select {
+				case w.batchCh <- batch:
+				case <-w.readCtx.Done():
+					return
+				}
+				pending = nil
 			}
 		}
+	}
+}
+
+func (w *walListener) emitErr(err error) {
+	select {
+	case w.errCh <- err:
+	default:
+	}
+}
+
+func (w *walListener) Next(ctx context.Context) (Message, error) {
+	if len(w.buffered) > 0 {
+		msg := w.buffered[0]
+		w.buffered = w.buffered[1:]
+		return msg, nil
+	}
+	select {
+	case batch, ok := <-w.batchCh:
+		if !ok {
+			return Message{}, errWALClosed
+		}
+		w.mu.Lock()
+		w.inFlight = append(w.inFlight, inFlightBatch{lsn: batch.lsn, remaining: len(batch.messages)})
+		w.mu.Unlock()
+		if len(batch.messages) > 1 {
+			w.buffered = batch.messages[1:]
+		}
+		return batch.messages[0], nil
+	case err := <-w.errCh:
+		return Message{}, err
+	case <-ctx.Done():
+		return Message{}, ctx.Err()
 	}
 }
 
@@ -187,19 +282,45 @@ func (w *walListener) Confirm(ctx context.Context, ids ...int64) error {
 	if _, err := w.dbConn.Exec(ctx, w.deleteQuery, ids); err != nil {
 		return fmt.Errorf("outbox: delete ids=%v: %w", ids, err)
 	}
-	return w.sendStandbyStatus(ctx)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := len(ids)
+	for n > 0 && len(w.inFlight) > 0 {
+		head := &w.inFlight[0]
+		if head.remaining > n {
+			head.remaining -= n
+			n = 0
+			break
+		}
+		n -= head.remaining
+		w.confirmedLSN.Store(uint64(head.lsn))
+		w.inFlight[0] = inFlightBatch{}
+		w.inFlight = w.inFlight[1:]
+	}
+	return nil
+}
+
+func (w *walListener) Close(ctx context.Context) {
+	w.readStop()
+	<-w.readDone
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := w.sendStandbyStatus(flushCtx); err != nil && w.logger != nil {
+		w.logger.Error("outbox: final standby status failed", "err", err)
+	}
+	cancel()
+
+	_ = w.replConn.Close(ctx)
+	_ = w.dbConn.Close(ctx)
 }
 
 func (w *walListener) sendStandbyStatus(ctx context.Context) error {
-	err := pglogrepl.SendStandbyStatusUpdate(ctx, w.replConn, pglogrepl.StandbyStatusUpdate{
-		WALWritePosition: w.lastLSN,
-		WALFlushPosition: w.lastLSN,
-		WALApplyPosition: w.lastLSN,
+	lsn := pglogrepl.LSN(w.confirmedLSN.Load())
+	return pglogrepl.SendStandbyStatusUpdate(ctx, w.replConn, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: lsn,
+		WALFlushPosition: lsn,
+		WALApplyPosition: lsn,
 	})
-	if err != nil {
-		return fmt.Errorf("outbox: standby status update: %w", err)
-	}
-	return nil
 }
 
 func (w *walListener) decodeInsert(rel *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData) (Message, error) {

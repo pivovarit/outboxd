@@ -8,6 +8,8 @@ import (
 
 const maxRetryDelay = time.Minute
 
+const flushTimeout = 5 * time.Second
+
 type Message struct {
 	ID        int64
 	Topic     string
@@ -50,6 +52,12 @@ type Config struct {
 	// the relay outside the chain, so each retry attempt flows through every
 	// middleware. A nil or empty slice disables middleware entirely.
 	Middlewares []Middleware
+	// KeepaliveInterval drives both the relay's periodic-confirm ticker and
+	// the WAL listener's standby-status ticker. Bounds how long delivered
+	// rows can linger before deletion and how long a slow handler can
+	// starve replication slot updates. Must stay well below Postgres'
+	// wal_sender_timeout (default 60s).
+	KeepaliveInterval time.Duration
 }
 
 func (c *Config) setDefaults() {
@@ -76,6 +84,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
+	}
+	if c.KeepaliveInterval == 0 {
+		c.KeepaliveInterval = 5 * time.Second
 	}
 	if c.Polling != nil {
 		if c.Polling.PollInterval == 0 {
@@ -132,30 +143,80 @@ func (r *Relay) Start(ctx context.Context) error {
 }
 
 func (r *Relay) run(ctx context.Context, src source) error {
-	var pendingConfirm []int64
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	msgCh := make(chan Message)
+	nextErrCh := make(chan error, 1)
+
+	go func() {
+		for {
+			msg, err := src.Next(subCtx)
+			if err != nil {
+				nextErrCh <- err
+				return
+			}
+			select {
+			case msgCh <- msg:
+			case <-subCtx.Done():
+				return
+			}
+		}
+	}()
+
+	var pending []int64
+	ticker := time.NewTicker(r.cfg.KeepaliveInterval)
+	defer ticker.Stop()
+
+	flush := func(c context.Context) error {
+		if len(pending) == 0 {
+			return nil
+		}
+		if err := src.Confirm(c, pending...); err != nil {
+			return err
+		}
+		pending = nil
+		return nil
+	}
+
+	defer func() {
+		if len(pending) == 0 {
+			return
+		}
+		ids := pending
+		fCtx, fCancel := context.WithTimeout(context.Background(), flushTimeout)
+		defer fCancel()
+		if err := flush(fCtx); err != nil {
+			r.cfg.Logger.Error("outbox: flush on close failed", "ids", ids, "err", err)
+		}
+	}()
 
 	for {
-		msg, err := src.Next(ctx)
-		if err != nil {
+		select {
+		case err := <-nextErrCh:
 			return err
-		}
-
-		r.cfg.Logger.Info("outbox: message received", "id", msg.ID, "topic", msg.Topic)
-
-		if err := r.deliverWithRetry(ctx, msg); err != nil {
-			return err
-		}
-
-		pendingConfirm = append(pendingConfirm, msg.ID)
-
-		if src.Remaining() == 0 {
-			if err := src.Confirm(ctx, pendingConfirm...); err != nil {
+		case msg := <-msgCh:
+			r.cfg.Logger.Info("outbox: message received", "id", msg.ID, "topic", msg.Topic)
+			if err := r.deliverWithRetry(ctx, msg); err != nil {
 				return err
 			}
-			pendingConfirm = nil
-		}
-
-		if ctx.Err() != nil {
+			pending = append(pending, msg.ID)
+			if src.Remaining() == 0 {
+				fCtx, fCancel := context.WithTimeout(context.Background(), flushTimeout)
+				err := flush(fCtx)
+				fCancel()
+				if err != nil {
+					return err
+				}
+			}
+		case <-ticker.C:
+			fCtx, fCancel := context.WithTimeout(context.Background(), flushTimeout)
+			err := flush(fCtx)
+			fCancel()
+			if err != nil {
+				return err
+			}
+		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
