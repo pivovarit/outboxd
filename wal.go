@@ -231,13 +231,42 @@ func (w *walListener) readLoop() {
 					continue
 				}
 				batch := walBatch{messages: pending, lsn: txLSN}
-				select {
-				case w.batchCh <- batch:
-				case <-w.readCtx.Done():
+				pending = nil
+				delivered, dErr := w.deliverBatch(batch, &nextStandby)
+				if dErr != nil {
+					w.emitErr(dErr)
 					return
 				}
-				pending = nil
+				if !delivered {
+					return
+				}
 			}
+		}
+	}
+}
+
+func (w *walListener) deliverBatch(batch walBatch, nextStandby *time.Time) (bool, error) {
+	for {
+		wait := time.Until(*nextStandby)
+		if wait <= 0 {
+			if err := w.sendStandbyStatus(w.readCtx); err != nil && w.readCtx.Err() == nil {
+				return false, fmt.Errorf("outbox: standby status update: %w", err)
+			}
+			if w.readCtx.Err() != nil {
+				return false, nil
+			}
+			*nextStandby = time.Now().Add(w.standbyInterval)
+			continue
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case w.batchCh <- batch:
+			timer.Stop()
+			return true, nil
+		case <-timer.C:
+		case <-w.readCtx.Done():
+			timer.Stop()
+			return false, nil
 		}
 	}
 }
