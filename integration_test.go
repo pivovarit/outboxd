@@ -979,8 +979,8 @@ func TestIntegration_Polling_RowsDeletedAtEndOfBuffer(t *testing.T) {
 
 	var (
 		mu       sync.Mutex
-		received []int64   // order of handler invocations, by msg ID
-		existed  []bool    // whether the row still existed at handler entry
+		received []int64
+		existed  []bool
 	)
 	done := make(chan struct{})
 	handler := func(_ context.Context, msg outboxd.Message) error {
