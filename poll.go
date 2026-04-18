@@ -116,9 +116,7 @@ func (p *pollSource) Next(ctx context.Context) (Message, error) {
 		}
 
 		if len(messages) > 0 {
-			p.buffered = messages[1:]
-			p.batchInFlight.Store(int32(len(messages)))
-			return messages[0], nil
+			return p.armBatch(messages), nil
 		}
 
 		if err := p.waitForActivity(ctx); err != nil {
@@ -151,6 +149,16 @@ func (p *pollSource) waitForActivity(ctx context.Context) error {
 		return nil
 	}
 	return nil
+}
+
+func (p *pollSource) armBatch(messages []Message) Message {
+	select {
+	case <-p.confirmCh:
+	default:
+	}
+	p.buffered = messages[1:]
+	p.batchInFlight.Store(int32(len(messages)))
+	return messages[0]
 }
 
 func (p *pollSource) Remaining() int {
