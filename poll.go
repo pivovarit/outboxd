@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -11,12 +12,15 @@ import (
 
 type pollSource struct {
 	conn          *pgx.Conn
+	deleteConn    *pgx.Conn
 	selectQuery   string
 	deleteQuery   string
 	pollInterval  time.Duration
 	batchSize     int
 	notifyChannel string
 	buffered      []Message
+	batchInFlight atomic.Int32
+	confirmCh     chan struct{}
 }
 
 func newPollSource(ctx context.Context, dsn string, cfg Config) (*pollSource, error) {
@@ -43,6 +47,12 @@ func newPollSource(ctx context.Context, dsn string, cfg Config) (*pollSource, er
 		}
 	}
 
+	deleteConn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		_ = conn.Close(ctx)
+		return nil, fmt.Errorf("outbox: poll delete connect: %w", err)
+	}
+
 	id := pgx.Identifier{schema.IDColumn}.Sanitize()
 	selectQuery := fmt.Sprintf("SELECT %s, %s, %s, %s FROM %s ORDER BY %s LIMIT $1",
 		id,
@@ -60,25 +70,35 @@ func newPollSource(ctx context.Context, dsn string, cfg Config) (*pollSource, er
 
 	return &pollSource{
 		conn:          conn,
+		deleteConn:    deleteConn,
 		selectQuery:   selectQuery,
 		deleteQuery:   deleteQuery,
 		pollInterval:  cfg.Polling.PollInterval,
 		batchSize:     cfg.Polling.BatchSize,
 		notifyChannel: cfg.Polling.NotifyChannel,
+		confirmCh:     make(chan struct{}, 1),
 	}, nil
 }
 
-func (p *pollSource) Next(ctx context.Context) (Message, error) {
+func (p *pollSource) Next(ctx context.Context) (Message, int, error) {
 	for {
 		if len(p.buffered) > 0 {
 			msg := p.buffered[0]
 			p.buffered = p.buffered[1:]
-			return msg, nil
+			return msg, len(p.buffered), nil
+		}
+
+		if p.batchInFlight.Load() > 0 {
+			select {
+			case <-p.confirmCh:
+			case <-ctx.Done():
+				return Message{}, 0, ctx.Err()
+			}
 		}
 
 		rows, err := p.conn.Query(ctx, p.selectQuery, p.batchSize)
 		if err != nil {
-			return Message{}, fmt.Errorf("outbox: poll query: %w", err)
+			return Message{}, 0, fmt.Errorf("outbox: poll query: %w", err)
 		}
 
 		var messages []Message
@@ -86,22 +106,22 @@ func (p *pollSource) Next(ctx context.Context) (Message, error) {
 			var msg Message
 			if err := rows.Scan(&msg.ID, &msg.Topic, &msg.Payload, &msg.CreatedAt); err != nil {
 				rows.Close()
-				return Message{}, fmt.Errorf("outbox: poll scan: %w", err)
+				return Message{}, 0, fmt.Errorf("outbox: poll scan: %w", err)
 			}
 			messages = append(messages, msg)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return Message{}, fmt.Errorf("outbox: poll rows: %w", err)
+			return Message{}, 0, fmt.Errorf("outbox: poll rows: %w", err)
 		}
 
 		if len(messages) > 0 {
-			p.buffered = messages[1:]
-			return messages[0], nil
+			msg := p.armBatch(messages)
+			return msg, len(p.buffered), nil
 		}
 
 		if err := p.waitForActivity(ctx); err != nil {
-			return Message{}, err
+			return Message{}, 0, err
 		}
 	}
 }
@@ -132,17 +152,31 @@ func (p *pollSource) waitForActivity(ctx context.Context) error {
 	return nil
 }
 
-func (p *pollSource) Remaining() int {
-	return len(p.buffered)
+func (p *pollSource) armBatch(messages []Message) Message {
+	select {
+	case <-p.confirmCh:
+	default:
+	}
+	p.buffered = messages[1:]
+	p.batchInFlight.Store(int32(len(messages)))
+	return messages[0]
 }
 
 func (p *pollSource) Confirm(ctx context.Context, ids ...int64) error {
-	if _, err := p.conn.Exec(ctx, p.deleteQuery, ids); err != nil {
+	if _, err := p.deleteConn.Exec(ctx, p.deleteQuery, ids); err != nil {
 		return fmt.Errorf("outbox: delete ids=%v: %w", ids, err)
+	}
+	if remaining := p.batchInFlight.Add(-int32(len(ids))); remaining <= 0 {
+		p.batchInFlight.Store(0)
+		select {
+		case p.confirmCh <- struct{}{}:
+		default:
+		}
 	}
 	return nil
 }
 
 func (p *pollSource) Close(ctx context.Context) {
 	_ = p.conn.Close(ctx)
+	_ = p.deleteConn.Close(ctx)
 }
