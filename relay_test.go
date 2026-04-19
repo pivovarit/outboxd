@@ -398,6 +398,37 @@ func BenchmarkWrap_None(b *testing.B) { benchmarkWrap(b, 0) }
 func BenchmarkWrap_One(b *testing.B)  { benchmarkWrap(b, 1) }
 func BenchmarkWrap_Five(b *testing.B) { benchmarkWrap(b, 5) }
 
+func TestNextDelay_DoublesAfterUnstableRun(t *testing.T) {
+	got := nextDelay(time.Second, time.Second, 0)
+	if got != 2*time.Second {
+		t.Errorf("expected 2s after fast-failing run, got %v", got)
+	}
+}
+
+func TestNextDelay_GrowsMonotonicallyUntilCap(t *testing.T) {
+	delay := time.Second
+	for i := 0; i < 20; i++ {
+		delay = nextDelay(delay, time.Second, 0)
+	}
+	if delay != maxRetryDelay {
+		t.Errorf("expected delay to reach cap after sustained failures, got %v", delay)
+	}
+}
+
+func TestNextDelay_ResetsAfterStableRun(t *testing.T) {
+	got := nextDelay(maxRetryDelay, time.Second, maxRetryDelay)
+	if got != time.Second {
+		t.Errorf("expected reset to base after stable run, got %v", got)
+	}
+}
+
+func TestNextDelay_ShortRunDoesNotReset(t *testing.T) {
+	got := nextDelay(4*time.Second, time.Second, maxRetryDelay-time.Second)
+	if got != 8*time.Second {
+		t.Errorf("expected delay to keep doubling after borderline-short run, got %v", got)
+	}
+}
+
 func TestConfig_KeepaliveIntervalDefault(t *testing.T) {
 	cfg := Config{}
 	cfg.setDefaults()
