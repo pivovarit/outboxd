@@ -117,6 +117,10 @@ CREATE PUBLICATION outbox_pub FOR TABLE outbox WITH (publish = 'insert');
 
 Column names and table name are configurable via `SchemaConfig`.
 
+## First start and pre-existing rows
+
+`outboxd` creates the replication slot on first start if it does not already exist. The slot's consistent point is fixed at creation, so rows inserted **before** the slot existed are not in its WAL stream and will not be delivered. If you need to relay a pre-existing backlog, drain it first (e.g. via polling mode) before switching to WAL mode.
+
 ## Polling mode
 
 If logical replication is not available (e.g. managed PostgreSQL without `wal_level=logical`, restricted permissions, or shared hosting), `outboxd` can fall back to a polling-based strategy. Enable it by providing a `PollingConfig`:
