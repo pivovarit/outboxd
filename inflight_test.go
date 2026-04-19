@@ -47,6 +47,14 @@ func TestTracker_ValidateUnknownIDOnEmptyTracker(t *testing.T) {
 	}
 }
 
+func TestTracker_ValidateRejectsDuplicateIDs(t *testing.T) {
+	tr := newInFlightTracker()
+	tr.Register(pglogrepl.LSN(100), []int64{1, 2, 3})
+	if err := tr.Validate([]int64{1, 1}); err == nil {
+		t.Fatal("expected error for duplicate id in confirm batch, got nil")
+	}
+}
+
 func TestTracker_ApplyDrainsBatchAdvancesLSN(t *testing.T) {
 	tr := newInFlightTracker()
 	tr.Register(pglogrepl.LSN(100), []int64{1, 2, 3})
