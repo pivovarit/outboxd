@@ -41,10 +41,15 @@ func (t *inFlightTracker) tracks(id int64) bool {
 }
 
 func (t *inFlightTracker) Validate(ids []int64) error {
+	seen := make(map[int64]struct{}, len(ids))
 	for _, id := range ids {
 		if _, ok := t.index[id]; !ok {
 			return fmt.Errorf("outboxd: confirm unknown id %d", id)
 		}
+		if _, dup := seen[id]; dup {
+			return fmt.Errorf("outboxd: confirm duplicate id %d", id)
+		}
+		seen[id] = struct{}{}
 	}
 	return nil
 }
