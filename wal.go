@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -40,10 +39,8 @@ type walListener struct {
 
 	buffered []Message
 
-	mu       sync.Mutex
-	inFlight []inFlightBatch
-
-	confirmedLSN atomic.Uint64
+	mu      sync.Mutex
+	tracker *inFlightTracker
 
 	logger interface {
 		Error(msg string, args ...any)
@@ -53,11 +50,6 @@ type walListener struct {
 type walBatch struct {
 	messages []Message
 	lsn      pglogrepl.LSN
-}
-
-type inFlightBatch struct {
-	lsn       pglogrepl.LSN
-	remaining int
 }
 
 var errWALClosed = errors.New("outbox: wal listener closed")
@@ -135,6 +127,7 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 		readCtx:         readCtx,
 		readStop:        readStop,
 		readDone:        make(chan struct{}),
+		tracker:         newInFlightTracker(),
 		logger:          cfg.Logger,
 	}
 
@@ -290,7 +283,11 @@ func (w *walListener) Next(ctx context.Context) (Message, int, error) {
 			return Message{}, 0, errWALClosed
 		}
 		w.mu.Lock()
-		w.inFlight = append(w.inFlight, inFlightBatch{lsn: batch.lsn, remaining: len(batch.messages)})
+		ids := make([]int64, len(batch.messages))
+		for i, m := range batch.messages {
+			ids[i] = m.ID
+		}
+		w.tracker.Register(batch.lsn, ids)
 		w.mu.Unlock()
 		if len(batch.messages) > 1 {
 			w.buffered = batch.messages[1:]
@@ -304,24 +301,20 @@ func (w *walListener) Next(ctx context.Context) (Message, int, error) {
 }
 
 func (w *walListener) Confirm(ctx context.Context, ids ...int64) error {
+	w.mu.Lock()
+	if err := w.tracker.Validate(ids); err != nil {
+		w.mu.Unlock()
+		panic(err)
+	}
+	w.mu.Unlock()
+
 	if _, err := w.dbConn.Exec(ctx, w.deleteQuery, ids); err != nil {
 		return fmt.Errorf("outbox: delete ids=%v: %w", ids, err)
 	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	n := len(ids)
-	for n > 0 && len(w.inFlight) > 0 {
-		head := &w.inFlight[0]
-		if head.remaining > n {
-			head.remaining -= n
-			n = 0
-			break
-		}
-		n -= head.remaining
-		w.confirmedLSN.Store(uint64(head.lsn))
-		w.inFlight[0] = inFlightBatch{}
-		w.inFlight = w.inFlight[1:]
-	}
+	w.tracker.Apply(ids)
 	return nil
 }
 
@@ -340,7 +333,9 @@ func (w *walListener) Close(ctx context.Context) {
 }
 
 func (w *walListener) sendStandbyStatus(ctx context.Context) error {
-	lsn := pglogrepl.LSN(w.confirmedLSN.Load())
+	w.mu.Lock()
+	lsn := w.tracker.ConfirmedLSN()
+	w.mu.Unlock()
 	return pglogrepl.SendStandbyStatusUpdate(ctx, w.replConn, pglogrepl.StandbyStatusUpdate{
 		WALWritePosition: lsn,
 		WALFlushPosition: lsn,
