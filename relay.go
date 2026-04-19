@@ -119,10 +119,12 @@ func (r *Relay) Start(ctx context.Context) error {
 		} else {
 			src, err = newWALListener(ctx, r.dsn, r.cfg)
 		}
+		var ranFor time.Duration
 		if err == nil {
-			delay = r.cfg.RetryDelay
+			started := time.Now()
 			err = r.run(ctx, src)
 			src.Close(ctx)
+			ranFor = time.Since(started)
 		}
 
 		if ctx.Err() != nil {
@@ -135,11 +137,19 @@ func (r *Relay) Start(ctx context.Context) error {
 			return ctx.Err()
 		case <-time.After(delay):
 		}
-		delay *= 2
-		if delay > maxRetryDelay {
-			delay = maxRetryDelay
-		}
+		delay = nextDelay(delay, r.cfg.RetryDelay, ranFor)
 	}
+}
+
+func nextDelay(current, base, ranFor time.Duration) time.Duration {
+	if ranFor >= maxRetryDelay {
+		return base
+	}
+	next := current * 2
+	if next > maxRetryDelay {
+		next = maxRetryDelay
+	}
+	return next
 }
 
 type nextResult struct {
