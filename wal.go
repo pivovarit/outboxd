@@ -75,7 +75,7 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 	err = dbConn.QueryRow(ctx,
 		"SELECT active FROM pg_replication_slots WHERE slot_name = $1",
 		cfg.SlotName).Scan(&active)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		_, err = pglogrepl.CreateReplicationSlot(ctx, replConn, cfg.SlotName, "pgoutput",
 			pglogrepl.CreateReplicationSlotOptions{Temporary: false})
 		if err != nil {
@@ -172,6 +172,10 @@ func (w *walListener) readLoop() {
 
 		cd, ok := rawMsg.(*pgproto3.CopyData)
 		if !ok {
+			continue
+		}
+
+		if len(cd.Data) == 0 {
 			continue
 		}
 
