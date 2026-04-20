@@ -121,6 +121,14 @@ Column names and table name are configurable via `SchemaConfig`.
 
 `outboxd` creates the replication slot on first start if it does not already exist. The slot's consistent point is fixed at creation, so rows inserted **before** the slot existed are not in its WAL stream and will not be delivered. If you need to relay a pre-existing backlog, drain it first (e.g. via polling mode) before switching to WAL mode.
 
+## Delivery semantics
+
+`outboxd` is at-least-once: a message can be delivered more than once if the relay crashes after the handler returns but before the WAL position is acknowledged (or, in polling mode, before the row is deleted). Consumers should treat `Message.ID` as a deduplication key.
+
+Messages are delivered in **commit order**, not in `Message.ID` order. If transaction A inserts `id=10` and transaction B inserts `id=11`, but B commits first, the consumer sees `11` before `10`. `Message.ID` is unique and safe to dedupe on, but it is **not** a high-watermark - a downstream that assumes "if I see id=N, I've seen everything < N" will be wrong.
+
+In polling mode this also affects latency: with `NotifyChannel` enabled, the leading committer is delivered immediately, but a late-committing transaction (`id=10` above) waits for the next `PollInterval` tick - its NOTIFY was already drained when the earlier commit fired.
+
 ## Polling mode
 
 If logical replication is not available (e.g. managed PostgreSQL without `wal_level=logical`, restricted permissions, or shared hosting), `outboxd` can fall back to a polling-based strategy. Enable it by providing a `PollingConfig`:
