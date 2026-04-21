@@ -3,6 +3,7 @@ package outboxd
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"time"
 )
 
@@ -58,6 +59,11 @@ type Config struct {
 	// starve replication slot updates. Must stay well below Postgres'
 	// wal_sender_timeout (default 60s).
 	KeepaliveInterval time.Duration
+	// HealthAddr, when set, starts an HTTP server exposing /health
+	// (liveness) and /ready (readiness) probe endpoints. The readiness
+	// probe returns 200 only while the relay has an active connection to
+	// PostgreSQL. Example: ":8080".
+	HealthAddr string
 }
 
 func (c *Config) setDefaults() {
@@ -102,14 +108,28 @@ type Relay struct {
 	dsn     string
 	handler Handler
 	cfg     Config
+	health  *healthServer
 }
 
 func New(dsn string, handler Handler, cfg Config) *Relay {
 	cfg.setDefaults()
-	return &Relay{dsn: dsn, handler: wrap(handler, cfg.Middlewares), cfg: cfg}
+	r := &Relay{dsn: dsn, handler: wrap(handler, cfg.Middlewares), cfg: cfg}
+	if cfg.HealthAddr != "" {
+		r.health = newHealthServer(cfg.HealthAddr)
+	}
+	return r
 }
 
 func (r *Relay) Start(ctx context.Context) error {
+	if r.health != nil {
+		go func() {
+			if err := r.health.listenAndServe(); err != nil && err != http.ErrServerClosed {
+				r.cfg.Logger.Error("outbox: health server error", "err", err)
+			}
+		}()
+		defer r.health.shutdown(context.Background())
+	}
+
 	delay := r.cfg.RetryDelay
 	for {
 		var src source
@@ -121,10 +141,16 @@ func (r *Relay) Start(ctx context.Context) error {
 		}
 		var ranFor time.Duration
 		if err == nil {
+			if r.health != nil {
+				r.health.ready.Store(true)
+			}
 			started := time.Now()
 			err = r.run(ctx, src)
 			src.Close(ctx)
 			ranFor = time.Since(started)
+			if r.health != nil {
+				r.health.ready.Store(false)
+			}
 		}
 
 		if ctx.Err() != nil {

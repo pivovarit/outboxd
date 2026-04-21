@@ -124,7 +124,7 @@ func TestRelay_RetriesOnHandlerError(t *testing.T) {
 		messages: []Message{{ID: 42, Topic: "test", Payload: []byte("payload")}},
 	}
 
-	startRelayWithFakeSource(ctx, src, handler, Config{RetryDelay: time.Millisecond}) //nolint:errcheck — we only care about side effects
+	startRelayWithFakeSource(ctx, src, handler, Config{RetryDelay: time.Millisecond})
 
 	if attempts != 3 {
 		t.Errorf("expected 3 handler attempts, got %d", attempts)

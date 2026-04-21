@@ -88,6 +88,19 @@ logging := func(next outboxd.Handler) outboxd.Handler {
 }
 ```
 
+## Health checks
+
+`outboxd` can expose liveness and readiness probe endpoints over HTTP. Set `HealthAddr` to start a lightweight HTTP server alongside the relay:
+
+```go
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    HealthAddr: ":8080",
+})
+```
+
+- `GET /health` - liveness probe, always returns `200`
+- `GET /ready` - readiness probe, returns `200` while connected to PostgreSQL, `503` otherwise
+
 ## Running the example
 
 Try it with a single command:
