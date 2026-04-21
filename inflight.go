@@ -66,6 +66,7 @@ func (t *inFlightTracker) Apply(ids []int64) (pglogrepl.LSN, bool) {
 	advanced := false
 	for len(t.batches) > 0 && len(t.batches[0].pending) == 0 {
 		t.confirmedLSN = t.batches[0].lsn
+		t.batches[0] = nil
 		t.batches = t.batches[1:]
 		advanced = true
 	}
