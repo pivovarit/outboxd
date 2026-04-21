@@ -159,12 +159,17 @@ type nextResult struct {
 
 func (r *Relay) run(ctx context.Context, src source) error {
 	subCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	msgCh := make(chan nextResult)
 	nextErrCh := make(chan error, 1)
+	nextDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-nextDone
+	}()
 
 	go func() {
+		defer close(nextDone)
 		for {
 			msg, remaining, err := src.Next(subCtx)
 			if err != nil {
