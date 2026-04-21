@@ -81,6 +81,10 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 		if err != nil {
 			_ = replConn.Close(ctx)
 			_ = dbConn.Close(ctx)
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == pgDuplicateObject {
+				return nil, fmt.Errorf("outbox: replication slot %q was created by another instance between check and create: %w", cfg.SlotName, err)
+			}
 			return nil, fmt.Errorf("outbox: create slot: %w", err)
 		}
 	} else if err != nil {
