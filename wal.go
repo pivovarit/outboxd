@@ -328,7 +328,10 @@ func (w *walListener) Confirm(ctx context.Context, ids ...int64) error {
 
 func (w *walListener) Close(ctx context.Context) {
 	w.readStop()
-	<-w.readDone
+	select {
+	case <-w.readDone:
+	case <-time.After(5 * time.Second):
+	}
 
 	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	if err := w.sendStandbyStatus(flushCtx); err != nil && w.logger != nil {

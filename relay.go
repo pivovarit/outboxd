@@ -127,7 +127,11 @@ func (r *Relay) Start(ctx context.Context) error {
 				r.cfg.Logger.Error("outbox: health server error", "err", err)
 			}
 		}()
-		defer r.health.shutdown(context.Background())
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			r.health.shutdown(shutdownCtx)
+		}()
 	}
 
 	delay := r.cfg.RetryDelay
