@@ -176,8 +176,8 @@ func TestRelay_DropsMessageAfterMaxRetries(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
-	if attempts != 3 {
-		t.Errorf("expected 3 attempts before drop, got %d", attempts)
+	if attempts != 4 {
+		t.Errorf("expected 4 attempts (1 initial + 3 retries) before drop, got %d", attempts)
 	}
 	if droppedMsg.ID != 1 {
 		t.Errorf("expected dropped message id 1, got %d", droppedMsg.ID)

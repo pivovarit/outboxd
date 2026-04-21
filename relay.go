@@ -270,22 +270,22 @@ func (r *Relay) run(ctx context.Context, src source) error {
 
 func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 	delay := r.cfg.RetryDelay
-	for attempt := 1; ; attempt++ {
+	for retries := 0; ; retries++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		if err := r.handler(ctx, msg); err != nil {
-			if r.cfg.MaxRetries > 0 && attempt >= r.cfg.MaxRetries {
+			if r.cfg.MaxRetries > 0 && retries >= r.cfg.MaxRetries {
 				r.cfg.Logger.Error("outbox: message dropped",
-					"id", msg.ID, "attempts", attempt, "err", err)
+					"id", msg.ID, "attempts", retries+1, "err", err)
 				if r.cfg.OnDropped != nil {
 					r.cfg.OnDropped(msg, err)
 				}
 				return nil
 			}
 			r.cfg.Logger.Error("outbox: handler error",
-				"id", msg.ID, "attempt", attempt, "err", err, "retry_in", delay)
+				"id", msg.ID, "attempt", retries+1, "err", err, "retry_in", delay)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
