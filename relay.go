@@ -150,7 +150,9 @@ func (r *Relay) Start(ctx context.Context) error {
 			}
 			started := time.Now()
 			err = r.run(ctx, src)
-			src.Close(ctx)
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			src.Close(closeCtx)
+			closeCancel()
 			ranFor = time.Since(started)
 			if r.health != nil {
 				r.health.ready.Store(false)
