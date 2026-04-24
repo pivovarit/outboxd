@@ -1193,3 +1193,82 @@ func TestIntegration_FlushOnContextCancel(t *testing.T) {
 		t.Errorf("expected outbox empty after flush-on-cancel, got %d", count)
 	}
 }
+
+func slotExists(t *testing.T, dsn, slot string) bool {
+	t.Helper()
+	conn, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("slot check connect: %v", err)
+	}
+	defer conn.Close(context.Background())
+	var exists bool
+	if err := conn.QueryRow(context.Background(),
+		"SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+		slot).Scan(&exists); err != nil {
+		t.Fatalf("slot check query: %v", err)
+	}
+	return exists
+}
+
+func TestIntegration_DropSlot(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+	setupOutbox(t, dsn)
+
+	const slot = "test_slot_drop"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	delivered := make(chan struct{}, 1)
+	relay := outboxd.New(dsn, func(_ context.Context, _ outboxd.Message) error {
+		select {
+		case delivered <- struct{}{}:
+		default:
+		}
+		return nil
+	}, outboxd.Config{
+		SlotName:     slot,
+		Publications: []string{"outbox_pub"},
+		RetryDelay:   10 * time.Millisecond,
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertRows(t, dsn, 1)
+
+	select {
+	case <-delivered:
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-relayErr
+		t.Fatal("handler never invoked")
+	}
+
+	cancel()
+	<-relayErr
+
+	if !slotExists(t, dsn, slot) {
+		t.Fatal("slot should exist before DropSlot")
+	}
+
+	if err := outboxd.DropSlot(context.Background(), dsn, slot); err != nil {
+		t.Fatalf("DropSlot: %v", err)
+	}
+
+	if slotExists(t, dsn, slot) {
+		t.Fatal("slot should not exist after DropSlot")
+	}
+}
+
+func TestIntegration_DropSlot_NonExistent(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+
+	err := outboxd.DropSlot(context.Background(), dsn, "no_such_slot")
+	if err == nil {
+		t.Fatal("expected error when dropping non-existent slot")
+	}
+}
