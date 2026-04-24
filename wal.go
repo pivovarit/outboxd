@@ -348,16 +348,20 @@ func (w *walListener) Confirm(ctx context.Context, ids ...int64) error {
 
 func (w *walListener) Close(ctx context.Context) {
 	w.readStop()
+	readExited := false
 	select {
 	case <-w.readDone:
+		readExited = true
 	case <-time.After(5 * time.Second):
 	}
 
-	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	if err := w.sendStandbyStatus(flushCtx); err != nil && w.logger != nil {
-		w.logger.Error("outbox: final standby status failed", "err", err)
+	if readExited {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := w.sendStandbyStatus(flushCtx); err != nil && w.logger != nil {
+			w.logger.Error("outbox: final standby status failed", "err", err)
+		}
+		cancel()
 	}
-	cancel()
 
 	_ = w.replConn.Close(ctx)
 	_ = w.dbConn.Close(ctx)
