@@ -54,6 +54,26 @@ type walBatch struct {
 
 var errWALClosed = errors.New("outbox: wal listener closed")
 
+// DropSlot drops the named replication slot from the PostgreSQL server.
+// Call this when permanently decommissioning a relay to prevent WAL
+// accumulation on the server.
+func DropSlot(ctx context.Context, dsn string, slotName string) error {
+	cfg, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("outbox: parse dsn: %w", err)
+	}
+	cfg.RuntimeParams["replication"] = "database"
+	conn, err := pgconn.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("outbox: replication connect: %w", err)
+	}
+	defer conn.Close(ctx)
+	if err := pglogrepl.DropReplicationSlot(ctx, conn, slotName, pglogrepl.DropReplicationSlotOptions{}); err != nil {
+		return fmt.Errorf("outbox: drop slot %q: %w", slotName, err)
+	}
+	return nil
+}
+
 func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, error) {
 	replCfg, err := pgconn.ParseConfig(dsn)
 	if err != nil {
