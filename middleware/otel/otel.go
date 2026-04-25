@@ -3,11 +3,13 @@ package otel
 import (
 	"context"
 	"strconv"
+	"time"
 
 	"github.com/pivovarit/outboxd"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -19,6 +21,7 @@ const (
 
 type config struct {
 	tp     trace.TracerProvider
+	mp     metric.MeterProvider
 	system string
 }
 
@@ -29,6 +32,15 @@ func WithTracerProvider(tp trace.TracerProvider) Option {
 	return func(c *config) {
 		if tp != nil {
 			c.tp = tp
+		}
+	}
+}
+
+// WithMeterProvider overrides the MeterProvider. Defaults to otel.GetMeterProvider().
+func WithMeterProvider(mp metric.MeterProvider) Option {
+	return func(c *config) {
+		if mp != nil {
+			c.mp = mp
 		}
 	}
 }
@@ -73,6 +85,54 @@ func Tracing(opts ...Option) outboxd.Middleware {
 				return err
 			}
 			return nil
+		}
+	}
+}
+
+// Metrics returns an outboxd.Middleware that records delivery metrics per
+// handler invocation: a counter for the number of publish attempts and a
+// histogram for handler latency. Each instrument carries messaging.system,
+// messaging.destination.name, and messaging.publish.status attributes.
+func Metrics(opts ...Option) outboxd.Middleware {
+	cfg := config{mp: otel.GetMeterProvider(), system: defaultSystem}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	meter := cfg.mp.Meter(instrumentationName)
+
+	messages, err := meter.Int64Counter("messaging.publish.messages",
+		metric.WithUnit("{message}"),
+		metric.WithDescription("Number of publish attempts"))
+	if err != nil {
+		otel.Handle(err)
+	}
+
+	duration, err := meter.Int64Histogram("messaging.publish.duration",
+		metric.WithUnit("ms"),
+		metric.WithDescription("Handler latency per publish attempt"))
+	if err != nil {
+		otel.Handle(err)
+	}
+
+	return func(next outboxd.Handler) outboxd.Handler {
+		return func(ctx context.Context, msg outboxd.Message) error {
+			start := time.Now()
+			err := next(ctx, msg)
+
+			status := "delivered"
+			if err != nil {
+				status = "failed"
+			}
+
+			attrs := metric.WithAttributes(
+				attribute.String("messaging.system", cfg.system),
+				attribute.String("messaging.destination.name", msg.Topic),
+				attribute.String("messaging.publish.status", status),
+			)
+			messages.Add(ctx, 1, attrs)
+			duration.Record(ctx, time.Since(start).Milliseconds(), attrs)
+
+			return err
 		}
 	}
 }

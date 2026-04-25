@@ -88,6 +88,37 @@ logging := func(next outboxd.Handler) outboxd.Handler {
 }
 ```
 
+### OpenTelemetry
+
+The `middleware/otel` package provides ready-made middleware for tracing and metrics:
+
+```go
+import (
+    "github.com/pivovarit/outboxd"
+    "github.com/pivovarit/outboxd/middleware"
+    "github.com/pivovarit/outboxd/middleware/otel"
+)
+
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    SlotName:     "outbox_relay",
+    Publications: []string{"outbox_pub"},
+    Middlewares: []outboxd.Middleware{
+        middleware.Recover(),
+        otel.Tracing(),
+        otel.Metrics(),
+    },
+})
+```
+
+`Tracing()` emits a span per delivery attempt. `Metrics()` records a `messaging.publish.messages` counter and a `messaging.publish.duration` histogram (in ms). Both follow the OpenTelemetry [messaging semantic conventions](https://opentelemetry.io/docs/specs/semconv/messaging/).
+
+By default, the middleware uses the global `TracerProvider` and `MeterProvider`. Override them with options:
+
+```go
+otel.Tracing(otel.WithTracerProvider(tp), otel.WithMessagingSystem("kafka"))
+otel.Metrics(otel.WithMeterProvider(mp), otel.WithMessagingSystem("kafka"))
+```
+
 ## Health checks
 
 `outboxd` can expose liveness and readiness probe endpoints over HTTP. Set `HealthAddr` to start a lightweight HTTP server alongside the relay:
