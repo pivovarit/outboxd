@@ -107,8 +107,8 @@ func Metrics(opts ...Option) outboxd.Middleware {
 		otel.Handle(err)
 	}
 
-	duration, err := meter.Float64Histogram("messaging.publish.duration",
-		metric.WithUnit("s"),
+	duration, err := meter.Int64Histogram("messaging.publish.duration",
+		metric.WithUnit("ms"),
 		metric.WithDescription("Handler latency per publish attempt"))
 	if err != nil {
 		otel.Handle(err)
@@ -130,7 +130,7 @@ func Metrics(opts ...Option) outboxd.Middleware {
 				attribute.String("messaging.publish.status", status),
 			)
 			messages.Add(ctx, 1, attrs)
-			duration.Record(ctx, time.Since(start).Seconds(), attrs)
+			duration.Record(ctx, time.Since(start).Milliseconds(), attrs)
 
 			return err
 		}

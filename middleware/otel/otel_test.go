@@ -213,9 +213,9 @@ func TestMetrics_SuccessfulDelivery(t *testing.T) {
 	if histogram == nil {
 		t.Fatal("missing messaging.publish.duration metric")
 	}
-	hist, ok := histogram.Data.(metricdata.Histogram[float64])
+	hist, ok := histogram.Data.(metricdata.Histogram[int64])
 	if !ok {
-		t.Fatalf("expected Histogram[float64], got %T", histogram.Data)
+		t.Fatalf("expected Histogram[int64], got %T", histogram.Data)
 	}
 	if len(hist.DataPoints) != 1 {
 		t.Fatalf("expected 1 histogram data point, got %d", len(hist.DataPoints))
@@ -256,7 +256,7 @@ func TestMetrics_HandlerError(t *testing.T) {
 	if histogram == nil {
 		t.Fatal("missing messaging.publish.duration metric")
 	}
-	hist := histogram.Data.(metricdata.Histogram[float64])
+	hist := histogram.Data.(metricdata.Histogram[int64])
 	if len(hist.DataPoints) != 1 {
 		t.Fatalf("expected 1 histogram data point, got %d", len(hist.DataPoints))
 	}
