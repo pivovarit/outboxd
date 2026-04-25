@@ -4,7 +4,10 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const maxRetryDelay = time.Minute
@@ -31,6 +34,13 @@ type SchemaConfig struct {
 	TopicColumn     string
 	PayloadColumn   string
 	CreatedAtColumn string
+}
+
+func (s SchemaConfig) tableIdent() pgx.Identifier {
+	if ns, name, ok := strings.Cut(s.Table, "."); ok {
+		return pgx.Identifier{ns, name}
+	}
+	return pgx.Identifier{s.Table}
 }
 
 type PollingConfig struct {
