@@ -2,6 +2,7 @@ FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 COPY go.mod go.sum *.go ./
+COPY middleware/ ./middleware/
 
 COPY example/go.mod example/go.sum ./example/
 WORKDIR /src/example
