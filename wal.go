@@ -19,6 +19,7 @@ type walListener struct {
 	replConn *pgconn.PgConn
 	dbConn   *pgx.Conn
 
+	tableNamespace  string
 	tableName       string
 	idColumn        string
 	topicColumn     string
@@ -129,9 +130,18 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 	}
 
 	schema := cfg.Schema
+	tableIdent := schema.tableIdent()
 	deleteQuery := fmt.Sprintf("DELETE FROM %s WHERE %s = ANY($1)",
-		pgx.Identifier{schema.Table}.Sanitize(),
+		tableIdent.Sanitize(),
 		pgx.Identifier{schema.IDColumn}.Sanitize())
+
+	var tableNamespace, tableName string
+	if len(tableIdent) > 1 {
+		tableNamespace = tableIdent[0]
+		tableName = tableIdent[1]
+	} else {
+		tableName = tableIdent[0]
+	}
 
 	readCtx, readStop := context.WithCancel(context.Background())
 	w := &walListener{
@@ -139,7 +149,8 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 		dbConn:          dbConn,
 		relations:       make(map[uint32]*pglogrepl.RelationMessage),
 		typeMap:         pgtype.NewMap(),
-		tableName:       schema.Table,
+		tableNamespace:  tableNamespace,
+		tableName:       tableName,
 		idColumn:        schema.IDColumn,
 		topicColumn:     schema.TopicColumn,
 		payloadColumn:   schema.PayloadColumn,
@@ -239,6 +250,9 @@ func (w *walListener) readLoop() {
 			case *pglogrepl.InsertMessage:
 				rel, rOK := w.relations[m.RelationID]
 				if !rOK || rel.RelationName != w.tableName {
+					continue
+				}
+				if w.tableNamespace != "" && rel.Namespace != w.tableNamespace {
 					continue
 				}
 				decoded, dErr := w.decodeInsert(rel, m.Tuple)

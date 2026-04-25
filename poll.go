@@ -54,17 +54,18 @@ func newPollSource(ctx context.Context, dsn string, cfg Config) (*pollSource, er
 	}
 
 	id := pgx.Identifier{schema.IDColumn}.Sanitize()
+	tableIdent := schema.tableIdent().Sanitize()
 	selectQuery := fmt.Sprintf("SELECT %s, %s, %s, %s FROM %s ORDER BY %s LIMIT $1",
 		id,
 		pgx.Identifier{schema.TopicColumn}.Sanitize(),
 		pgx.Identifier{schema.PayloadColumn}.Sanitize(),
 		pgx.Identifier{schema.CreatedAtColumn}.Sanitize(),
-		pgx.Identifier{schema.Table}.Sanitize(),
+		tableIdent,
 		id,
 	)
 
 	deleteQuery := fmt.Sprintf("DELETE FROM %s WHERE %s = ANY($1)",
-		pgx.Identifier{schema.Table}.Sanitize(),
+		tableIdent,
 		id,
 	)
 
