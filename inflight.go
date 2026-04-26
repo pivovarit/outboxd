@@ -54,6 +54,12 @@ func (t *inFlightTracker) Validate(ids []int64) error {
 	return nil
 }
 
+func (t *inFlightTracker) AdvanceIdle(lsn pglogrepl.LSN) {
+	if len(t.batches) == 0 && lsn > t.confirmedLSN {
+		t.confirmedLSN = lsn
+	}
+}
+
 func (t *inFlightTracker) Apply(ids []int64) (pglogrepl.LSN, bool) {
 	for _, id := range ids {
 		b, ok := t.index[id]
