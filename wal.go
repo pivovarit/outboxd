@@ -263,6 +263,9 @@ func (w *walListener) readLoop() {
 				pending = append(pending, decoded)
 			case *pglogrepl.CommitMessage:
 				if len(pending) == 0 {
+					w.mu.Lock()
+					w.tracker.AdvanceIdle(txLSN)
+					w.mu.Unlock()
 					continue
 				}
 				batch := walBatch{messages: pending, lsn: txLSN}

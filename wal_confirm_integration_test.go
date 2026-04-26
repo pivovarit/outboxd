@@ -271,6 +271,52 @@ func TestIntegration_WAL_ConfirmUnknownIDPanics(t *testing.T) {
 	_ = w.Confirm(context.Background(), 999999)
 }
 
+func TestIntegration_WAL_IdleNonInsertTrafficAdvancesLSN(t *testing.T) {
+	dsn, cleanup := startPG(t)
+	defer cleanup()
+	setupOutboxTable(t, dsn)
+
+	const slot = "test_slot_idle_advance"
+	w := startListener(t, dsn, slot)
+	defer w.Close(context.Background())
+
+	insertOneTx(t, dsn, "seed")
+	ids := drainBatch(t, w)
+
+	ctx := context.Background()
+	if err := w.Confirm(ctx, ids...); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+
+	w.mu.Lock()
+	lsnAfterConfirm := w.tracker.ConfirmedLSN()
+	w.mu.Unlock()
+	if lsnAfterConfirm == 0 {
+		t.Fatal("expected confirmedLSN > 0 after confirm")
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for AdvanceIdle to bump LSN beyond confirmed batch")
+		}
+		w.mu.Lock()
+		lsn := w.tracker.ConfirmedLSN()
+		w.mu.Unlock()
+		if lsn > lsnAfterConfirm {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if err := w.sendStandbyStatus(ctx); err != nil {
+		t.Fatalf("sendStandbyStatus: %v", err)
+	}
+	if slotLSN := slotConfirmedLSN(t, dsn, slot); slotLSN <= lsnAfterConfirm {
+		t.Errorf("expected slot confirmed_flush_lsn to advance beyond %v, got %v", lsnAfterConfirm, slotLSN)
+	}
+}
+
 func TestIntegration_WAL_ConfirmDeleteFailurePreservesState(t *testing.T) {
 	dsn, cleanup := startPG(t)
 	defer cleanup()

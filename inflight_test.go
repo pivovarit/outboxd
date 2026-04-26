@@ -120,6 +120,51 @@ func TestTracker_ApplyLaterBatchDoesNotAdvancePastUndelivered(t *testing.T) {
 	}
 }
 
+func TestTracker_AdvanceIdleBumpsLSNWhenNoBatches(t *testing.T) {
+	tr := newInFlightTracker()
+
+	tr.AdvanceIdle(pglogrepl.LSN(50))
+
+	if got := tr.ConfirmedLSN(); got != pglogrepl.LSN(50) {
+		t.Errorf("expected ConfirmedLSN=50 after idle advance, got %v", got)
+	}
+}
+
+func TestTracker_AdvanceIdleNoOpWhenBatchesInFlight(t *testing.T) {
+	tr := newInFlightTracker()
+	tr.Register(pglogrepl.LSN(100), []int64{1, 2})
+
+	tr.AdvanceIdle(pglogrepl.LSN(200))
+
+	if got := tr.ConfirmedLSN(); got != 0 {
+		t.Errorf("expected ConfirmedLSN=0 with in-flight batches, got %v", got)
+	}
+}
+
+func TestTracker_AdvanceIdleDoesNotRegress(t *testing.T) {
+	tr := newInFlightTracker()
+	tr.Register(pglogrepl.LSN(100), []int64{1})
+	tr.Apply([]int64{1})
+
+	tr.AdvanceIdle(pglogrepl.LSN(50))
+
+	if got := tr.ConfirmedLSN(); got != pglogrepl.LSN(100) {
+		t.Errorf("expected ConfirmedLSN=100 (no regression), got %v", got)
+	}
+}
+
+func TestTracker_AdvanceIdleWorksAfterAllBatchesDrained(t *testing.T) {
+	tr := newInFlightTracker()
+	tr.Register(pglogrepl.LSN(100), []int64{1})
+	tr.Apply([]int64{1})
+
+	tr.AdvanceIdle(pglogrepl.LSN(200))
+
+	if got := tr.ConfirmedLSN(); got != pglogrepl.LSN(200) {
+		t.Errorf("expected ConfirmedLSN=200 after all drained + idle advance, got %v", got)
+	}
+}
+
 func TestTracker_ApplyCrossBatch(t *testing.T) {
 	tr := newInFlightTracker()
 	tr.Register(pglogrepl.LSN(100), []int64{1, 2, 3})
