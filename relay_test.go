@@ -372,6 +372,112 @@ func TestRelay_NilMiddlewaresBehavesIdentically(t *testing.T) {
 	}
 }
 
+func TestSchemaConfig_TopicEnabled(t *testing.T) {
+	tests := []struct {
+		column string
+		want   bool
+	}{
+		{"topic", true},
+		{"event_type", true},
+		{"", false},
+		{"-", false},
+	}
+	for _, tt := range tests {
+		cfg := SchemaConfig{TopicColumn: tt.column}
+		if got := cfg.topicEnabled(); got != tt.want {
+			t.Errorf("topicEnabled(%q) = %v, want %v", tt.column, got, tt.want)
+		}
+	}
+}
+
+func TestSchemaConfig_CreatedAtEnabled(t *testing.T) {
+	tests := []struct {
+		column string
+		want   bool
+	}{
+		{"created_at", true},
+		{"inserted_at", true},
+		{"", false},
+		{"-", false},
+	}
+	for _, tt := range tests {
+		cfg := SchemaConfig{CreatedAtColumn: tt.column}
+		if got := cfg.createdAtEnabled(); got != tt.want {
+			t.Errorf("createdAtEnabled(%q) = %v, want %v", tt.column, got, tt.want)
+		}
+	}
+}
+
+func TestSetDefaults_FiltersExtraColumnCollisions(t *testing.T) {
+	cfg := Config{
+		Schema: SchemaConfig{
+			Table:           "outbox",
+			IDColumn:        "id",
+			TopicColumn:     "topic",
+			PayloadColumn:   "payload",
+			CreatedAtColumn: "created_at",
+			ExtraColumns:    []string{"aggregate_id", "id", "topic", "payload", "created_at", "partition_key"},
+		},
+	}
+	cfg.setDefaults()
+
+	want := []string{"aggregate_id", "partition_key"}
+	if len(cfg.Schema.ExtraColumns) != len(want) {
+		t.Fatalf("ExtraColumns = %v, want %v", cfg.Schema.ExtraColumns, want)
+	}
+	for i, got := range cfg.Schema.ExtraColumns {
+		if got != want[i] {
+			t.Errorf("ExtraColumns[%d] = %q, want %q", i, got, want[i])
+		}
+	}
+}
+
+func TestSetDefaults_FiltersExtraColumnCollisionsWithCustomNames(t *testing.T) {
+	cfg := Config{
+		Schema: SchemaConfig{
+			IDColumn:        "event_id",
+			TopicColumn:     "event_type",
+			PayloadColumn:   "data",
+			CreatedAtColumn: "inserted_at",
+			ExtraColumns:    []string{"event_id", "event_type", "data", "inserted_at", "partition_key"},
+		},
+	}
+	cfg.setDefaults()
+
+	want := []string{"partition_key"}
+	if len(cfg.Schema.ExtraColumns) != len(want) {
+		t.Fatalf("ExtraColumns = %v, want %v", cfg.Schema.ExtraColumns, want)
+	}
+	if cfg.Schema.ExtraColumns[0] != "partition_key" {
+		t.Errorf("ExtraColumns[0] = %q, want %q", cfg.Schema.ExtraColumns[0], "partition_key")
+	}
+}
+
+func TestSetDefaults_NoFilteringWhenNoExtras(t *testing.T) {
+	cfg := Config{}
+	cfg.setDefaults()
+
+	if cfg.Schema.ExtraColumns != nil {
+		t.Errorf("ExtraColumns should be nil, got %v", cfg.Schema.ExtraColumns)
+	}
+}
+
+func TestSetDefaults_DisabledColumnsNotFiltered(t *testing.T) {
+	cfg := Config{
+		Schema: SchemaConfig{
+			TopicColumn:     "-",
+			CreatedAtColumn: "-",
+			ExtraColumns:    []string{"event_type", "inserted_at"},
+		},
+	}
+	cfg.setDefaults()
+
+	want := []string{"event_type", "inserted_at"}
+	if len(cfg.Schema.ExtraColumns) != len(want) {
+		t.Fatalf("ExtraColumns = %v, want %v", cfg.Schema.ExtraColumns, want)
+	}
+}
+
 func benchmarkWrap(b *testing.B, n int) {
 	mws := make([]Middleware, n)
 	for i := range mws {

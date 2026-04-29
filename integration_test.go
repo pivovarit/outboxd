@@ -18,6 +18,14 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+var defaultSchema = outboxd.SchemaConfig{
+	Table:           "outbox",
+	IDColumn:        "id",
+	TopicColumn:     "topic",
+	PayloadColumn:   "payload",
+	CreatedAtColumn: "created_at",
+}
+
 func startPostgres(t *testing.T) (string, func()) {
 	t.Helper()
 	ctx := context.Background()
@@ -138,6 +146,7 @@ func TestIntegration_DeliversInOrder(t *testing.T) {
 		SlotName:     "test_slot_order",
 		Publications: []string{"outbox_pub"},
 		RetryDelay:   10 * time.Millisecond,
+		Schema:       defaultSchema,
 	})
 
 	relayErr := make(chan error, 1)
@@ -384,6 +393,7 @@ func TestIntegration_DeliversAllMessagesFromSingleTransaction(t *testing.T) {
 		SlotName:     "test_slot_single_tx",
 		Publications: []string{"outbox_pub"},
 		RetryDelay:   10 * time.Millisecond,
+		Schema:       defaultSchema,
 	})
 
 	relayErr := make(chan error, 1)
@@ -516,6 +526,7 @@ func TestIntegration_Polling_DeliversInOrder(t *testing.T) {
 
 	relay := outboxd.New(dsn, handler, outboxd.Config{
 		RetryDelay: 10 * time.Millisecond,
+		Schema:     defaultSchema,
 		Polling:    &outboxd.PollingConfig{PollInterval: 100 * time.Millisecond},
 	})
 
@@ -617,6 +628,7 @@ func TestIntegration_Polling_PgNotify(t *testing.T) {
 
 	relay := outboxd.New(dsn, handler, outboxd.Config{
 		RetryDelay: 10 * time.Millisecond,
+		Schema:     defaultSchema,
 		Polling: &outboxd.PollingConfig{
 			PollInterval:  10 * time.Second,
 			NotifyChannel: "outbox_events",
@@ -732,6 +744,7 @@ func TestIntegration_RetriesOnHandlerError(t *testing.T) {
 		SlotName:     "test_slot_retry",
 		Publications: []string{"outbox_pub"},
 		RetryDelay:   10 * time.Millisecond,
+		Schema:       defaultSchema,
 	})
 
 	relayErr := make(chan error, 1)
@@ -805,6 +818,7 @@ func TestIntegration_WAL_StandbyHeartbeatDuringSlowHandler(t *testing.T) {
 		Publications:      []string{"outbox_pub"},
 		RetryDelay:        10 * time.Millisecond,
 		KeepaliveInterval: keepalive,
+		Schema:            defaultSchema,
 	})
 
 	relayErr := make(chan error, 1)
@@ -911,6 +925,7 @@ func TestIntegration_WAL_HeartbeatDuringBackpressuredConsumer(t *testing.T) {
 		Publications:      []string{"outbox_pub"},
 		RetryDelay:        10 * time.Millisecond,
 		KeepaliveInterval: keepalive,
+		Schema:            defaultSchema,
 	})
 
 	relayErr := make(chan error, 1)
@@ -991,6 +1006,7 @@ func TestIntegration_Polling_ConfirmBetweenFetchesWithBatchSize1(t *testing.T) {
 	relay := outboxd.New(dsn, handler, outboxd.Config{
 		RetryDelay:        10 * time.Millisecond,
 		KeepaliveInterval: 200 * time.Millisecond,
+		Schema:            defaultSchema,
 		Polling: &outboxd.PollingConfig{
 			PollInterval: 100 * time.Millisecond,
 			BatchSize:    1,
@@ -1089,6 +1105,7 @@ func TestIntegration_Polling_RowsDeletedAtEndOfBuffer(t *testing.T) {
 	relay := outboxd.New(dsn, handler, outboxd.Config{
 		RetryDelay:        10 * time.Millisecond,
 		KeepaliveInterval: time.Hour,
+		Schema:            defaultSchema,
 		Polling: &outboxd.PollingConfig{
 			PollInterval: 50 * time.Millisecond,
 			BatchSize:    3,
@@ -1161,6 +1178,7 @@ func TestIntegration_FlushOnContextCancel(t *testing.T) {
 		Publications:      []string{"outbox_pub"},
 		RetryDelay:        10 * time.Millisecond,
 		KeepaliveInterval: time.Hour,
+		Schema:            defaultSchema,
 	})
 
 	relayErr := make(chan error, 1)
@@ -1231,6 +1249,7 @@ func TestIntegration_DropSlot(t *testing.T) {
 		SlotName:     slot,
 		Publications: []string{"outbox_pub"},
 		RetryDelay:   10 * time.Millisecond,
+		Schema:       defaultSchema,
 	})
 
 	relayErr := make(chan error, 1)
@@ -1270,5 +1289,633 @@ func TestIntegration_DropSlot_NonExistent(t *testing.T) {
 	err := outboxd.DropSlot(context.Background(), dsn, "no_such_slot")
 	if err == nil {
 		t.Fatal("expected error when dropping non-existent slot")
+	}
+}
+
+func setupOutboxWithExtras(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id            BIGSERIAL PRIMARY KEY,
+			topic         TEXT NOT NULL,
+			payload       BYTEA NOT NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+			aggregate_id  TEXT NOT NULL,
+			partition_key TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	_, err = conn.Exec(ctx, "CREATE PUBLICATION outbox_pub FOR TABLE outbox")
+	if err != nil {
+		t.Fatalf("create publication: %v", err)
+	}
+}
+
+func insertRowsWithExtras(t *testing.T, dsn string, n int) []int64 {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	ids := make([]int64, 0, n)
+	for i := 0; i < n; i++ {
+		var id int64
+		err = conn.QueryRow(ctx,
+			"INSERT INTO outbox (topic, payload, aggregate_id, partition_key) VALUES ($1, $2, $3, $4) RETURNING id",
+			"test-topic",
+			[]byte(fmt.Sprintf("payload-%d", i)),
+			fmt.Sprintf("agg-%d", i),
+			fmt.Sprintf("pk-%d", i),
+		).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func setupOutboxPollingWithExtras(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id            BIGSERIAL PRIMARY KEY,
+			topic         TEXT NOT NULL,
+			payload       BYTEA NOT NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+			aggregate_id  TEXT NOT NULL,
+			partition_key TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+}
+
+func TestIntegration_WAL_ExtraColumns(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+	setupOutboxWithExtras(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		SlotName:     "test_slot_extras",
+		Publications: []string{"outbox_pub"},
+		RetryDelay:   10 * time.Millisecond,
+		Schema: outboxd.SchemaConfig{
+			Table:           "outbox",
+			IDColumn:        "id",
+			TopicColumn:     "topic",
+			PayloadColumn:   "payload",
+			CreatedAtColumn: "created_at",
+			ExtraColumns:    []string{"aggregate_id", "partition_key"},
+		},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertRowsWithExtras(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		if msg.Extras == nil {
+			t.Fatalf("message[%d]: Extras is nil", i)
+		}
+		wantAgg := fmt.Sprintf("agg-%d", i)
+		wantPK := fmt.Sprintf("pk-%d", i)
+		if got, _ := msg.Extras["aggregate_id"].(string); got != wantAgg {
+			t.Errorf("message[%d]: aggregate_id = %q, want %q", i, got, wantAgg)
+		}
+		if got, _ := msg.Extras["partition_key"].(string); got != wantPK {
+			t.Errorf("message[%d]: partition_key = %q, want %q", i, got, wantPK)
+		}
+	}
+}
+
+func TestIntegration_Polling_ExtraColumns(t *testing.T) {
+	dsn, cleanup := startPostgresWithoutWAL(t)
+	defer cleanup()
+	setupOutboxPollingWithExtras(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		RetryDelay: 10 * time.Millisecond,
+		Polling:    &outboxd.PollingConfig{PollInterval: 100 * time.Millisecond},
+		Schema: outboxd.SchemaConfig{
+			Table:           "outbox",
+			IDColumn:        "id",
+			TopicColumn:     "topic",
+			PayloadColumn:   "payload",
+			CreatedAtColumn: "created_at",
+			ExtraColumns:    []string{"aggregate_id", "partition_key"},
+		},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertRowsWithExtras(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		if msg.Extras == nil {
+			t.Fatalf("message[%d]: Extras is nil", i)
+		}
+		wantAgg := fmt.Sprintf("agg-%d", i)
+		wantPK := fmt.Sprintf("pk-%d", i)
+		if got, _ := msg.Extras["aggregate_id"].(string); got != wantAgg {
+			t.Errorf("message[%d]: aggregate_id = %q, want %q", i, got, wantAgg)
+		}
+		if got, _ := msg.Extras["partition_key"].(string); got != wantPK {
+			t.Errorf("message[%d]: partition_key = %q, want %q", i, got, wantPK)
+		}
+	}
+}
+
+func setupMinimalOutbox(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id      BIGSERIAL PRIMARY KEY,
+			payload BYTEA NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	_, err = conn.Exec(ctx, "CREATE PUBLICATION outbox_pub FOR TABLE outbox")
+	if err != nil {
+		t.Fatalf("create publication: %v", err)
+	}
+}
+
+func insertMinimalRows(t *testing.T, dsn string, n int) []int64 {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	ids := make([]int64, 0, n)
+	for i := 0; i < n; i++ {
+		var id int64
+		err = conn.QueryRow(ctx,
+			"INSERT INTO outbox (payload) VALUES ($1) RETURNING id",
+			[]byte(fmt.Sprintf("payload-%d", i)),
+		).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func setupMinimalOutboxPolling(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id      BIGSERIAL PRIMARY KEY,
+			payload BYTEA NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+}
+
+func TestIntegration_WAL_DisabledColumns(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+	setupMinimalOutbox(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		SlotName:     "test_slot_disabled_cols",
+		Publications: []string{"outbox_pub"},
+		RetryDelay:   10 * time.Millisecond,
+		Schema: outboxd.SchemaConfig{
+			Table:           "outbox",
+			IDColumn:        "id",
+			PayloadColumn:   "payload",
+			TopicColumn:     "-",
+			CreatedAtColumn: "-",
+		},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertedIDs := insertMinimalRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		if msg.ID != insertedIDs[i] {
+			t.Errorf("message[%d]: id = %d, want %d", i, msg.ID, insertedIDs[i])
+		}
+		if msg.Topic != "" {
+			t.Errorf("message[%d]: topic = %q, want empty", i, msg.Topic)
+		}
+		if !msg.CreatedAt.IsZero() {
+			t.Errorf("message[%d]: created_at should be zero, got %v", i, msg.CreatedAt)
+		}
+		wantPayload := fmt.Sprintf("payload-%d", i)
+		if string(msg.Payload) != wantPayload {
+			t.Errorf("message[%d]: payload = %q, want %q", i, string(msg.Payload), wantPayload)
+		}
+	}
+}
+
+func TestIntegration_Polling_DisabledColumns(t *testing.T) {
+	dsn, cleanup := startPostgresWithoutWAL(t)
+	defer cleanup()
+	setupMinimalOutboxPolling(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		RetryDelay: 10 * time.Millisecond,
+		Polling:    &outboxd.PollingConfig{PollInterval: 100 * time.Millisecond},
+		Schema: outboxd.SchemaConfig{
+			Table:           "outbox",
+			IDColumn:        "id",
+			PayloadColumn:   "payload",
+			TopicColumn:     "-",
+			CreatedAtColumn: "-",
+		},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertedIDs := insertMinimalRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		if msg.ID != insertedIDs[i] {
+			t.Errorf("message[%d]: id = %d, want %d", i, msg.ID, insertedIDs[i])
+		}
+		if msg.Topic != "" {
+			t.Errorf("message[%d]: topic = %q, want empty", i, msg.Topic)
+		}
+		if !msg.CreatedAt.IsZero() {
+			t.Errorf("message[%d]: created_at should be zero, got %v", i, msg.CreatedAt)
+		}
+		wantPayload := fmt.Sprintf("payload-%d", i)
+		if string(msg.Payload) != wantPayload {
+			t.Errorf("message[%d]: payload = %q, want %q", i, string(msg.Payload), wantPayload)
+		}
+	}
+}
+
+func setupOutboxTextPayload(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id         BIGSERIAL PRIMARY KEY,
+			topic      TEXT NOT NULL,
+			payload    TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+}
+
+func insertTextPayloadRows(t *testing.T, dsn string, n int) []int64 {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	ids := make([]int64, 0, n)
+	for i := 0; i < n; i++ {
+		var id int64
+		err = conn.QueryRow(ctx,
+			"INSERT INTO outbox (topic, payload) VALUES ($1, $2) RETURNING id",
+			"test-topic",
+			fmt.Sprintf(`{"index":%d}`, i),
+		).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func setupOutboxJSONBPayload(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id         BIGSERIAL PRIMARY KEY,
+			topic      TEXT NOT NULL,
+			payload    JSONB NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+}
+
+func TestIntegration_Polling_TextPayload(t *testing.T) {
+	dsn, cleanup := startPostgresWithoutWAL(t)
+	defer cleanup()
+	setupOutboxTextPayload(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		RetryDelay: 10 * time.Millisecond,
+		Schema:     defaultSchema,
+		Polling:    &outboxd.PollingConfig{PollInterval: 100 * time.Millisecond},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertTextPayloadRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		want := fmt.Sprintf(`{"index":%d}`, i)
+		if string(msg.Payload) != want {
+			t.Errorf("message[%d]: payload = %q, want %q", i, string(msg.Payload), want)
+		}
+	}
+}
+
+func TestIntegration_Polling_JSONBPayload(t *testing.T) {
+	dsn, cleanup := startPostgresWithoutWAL(t)
+	defer cleanup()
+	setupOutboxJSONBPayload(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		RetryDelay: 10 * time.Millisecond,
+		Schema:     defaultSchema,
+		Polling:    &outboxd.PollingConfig{PollInterval: 100 * time.Millisecond},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertTextPayloadRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		if len(msg.Payload) == 0 {
+			t.Errorf("message[%d]: payload is empty", i)
+		}
 	}
 }

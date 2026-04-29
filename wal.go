@@ -26,6 +26,7 @@ type walListener struct {
 	payloadColumn   string
 	createdAtColumn string
 	deleteQuery     string
+	extraColumnsSet map[string]struct{}
 
 	standbyInterval time.Duration
 
@@ -143,6 +144,11 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 		tableName = tableIdent[0]
 	}
 
+	extraSet := make(map[string]struct{}, len(cfg.Schema.ExtraColumns))
+	for _, ec := range cfg.Schema.ExtraColumns {
+		extraSet[ec] = struct{}{}
+	}
+
 	readCtx, readStop := context.WithCancel(context.Background())
 	w := &walListener{
 		replConn:        replConn,
@@ -156,6 +162,7 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 		payloadColumn:   schema.PayloadColumn,
 		createdAtColumn: schema.CreatedAtColumn,
 		deleteQuery:     deleteQuery,
+		extraColumnsSet: extraSet,
 		standbyInterval: cfg.KeepaliveInterval,
 		batchCh:         make(chan walBatch),
 		errCh:           make(chan error, 1),
@@ -397,6 +404,7 @@ func (w *walListener) sendStandbyStatus(ctx context.Context) error {
 
 func (w *walListener) decodeInsert(rel *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData) (Message, error) {
 	var msg Message
+	var extras map[string]any
 	for i, col := range tuple.Columns {
 		if col.DataType != 't' {
 			continue
@@ -426,7 +434,20 @@ func (w *walListener) decodeInsert(rel *pglogrepl.RelationMessage, tuple *pglogr
 				return Message{}, fmt.Errorf("outbox: decode created_at: %w", err)
 			}
 			msg.CreatedAt = v.Time
+		default:
+			if _, ok := w.extraColumnsSet[colDef.Name]; ok {
+				if extras == nil {
+					extras = make(map[string]any, len(w.extraColumnsSet))
+				}
+				var v any
+				if err := w.typeMap.Scan(colDef.DataType, pgtype.TextFormatCode, col.Data, &v); err != nil {
+					extras[colDef.Name] = string(col.Data)
+				} else {
+					extras[colDef.Name] = v
+				}
+			}
 		}
 	}
+	msg.Extras = extras
 	return msg, nil
 }

@@ -59,6 +59,13 @@ func main() {
 			SlotName:     slotName,
 			Publications: []string{"outbox_pub"},
 			RetryDelay:   time.Second,
+			Schema: outboxd.SchemaConfig{
+				Table:           "outbox",
+				IDColumn:        "id",
+				TopicColumn:     "topic",
+				PayloadColumn:   "payload",
+				CreatedAtColumn: "created_at",
+			},
 			Middlewares: []outboxd.Middleware{
 				middleware.Recover(),
 				outboxotel.Tracing(),
