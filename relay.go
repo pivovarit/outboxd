@@ -14,6 +14,7 @@ const maxRetryDelay = time.Minute
 
 const flushTimeout = 5 * time.Second
 
+// Message is a single outbox row delivered to the handler.
 type Message struct {
 	ID        int64
 	Topic     string
@@ -21,6 +22,9 @@ type Message struct {
 	CreatedAt time.Time
 }
 
+// Handler processes a single outbox message. Returning a non-nil error
+// triggers the relay's retry logic; returning nil marks the message as
+// delivered.
 type Handler func(ctx context.Context, msg Message) error
 
 // Middleware wraps a Handler and returns a new Handler. It is used to compose
@@ -28,6 +32,9 @@ type Handler func(ctx context.Context, msg Message) error
 // the user's handler without changing its signature.
 type Middleware func(Handler) Handler
 
+// SchemaConfig maps the outbox table and column names. All fields default
+// to the conventional names ("outbox", "id", "topic", "payload", "created_at")
+// when left empty.
 type SchemaConfig struct {
 	Table           string
 	IDColumn        string
@@ -43,12 +50,18 @@ func (s SchemaConfig) tableIdent() pgx.Identifier {
 	return pgx.Identifier{s.Table}
 }
 
+// PollingConfig enables poll-based delivery instead of WAL replication.
+// When set on [Config], the relay polls the outbox table at PollInterval,
+// optionally waking early via a PostgreSQL LISTEN/NOTIFY channel.
 type PollingConfig struct {
 	PollInterval  time.Duration
 	BatchSize     int
 	NotifyChannel string
 }
 
+// Config controls relay behaviour. Zero-value fields use sensible defaults;
+// see [Config.setDefaults] for the full list. Set Polling to a non-nil
+// [PollingConfig] to switch from WAL replication to poll-based delivery.
 type Config struct {
 	SlotName     string
 	Publications []string
@@ -114,6 +127,8 @@ func (c *Config) setDefaults() {
 	}
 }
 
+// Relay connects to PostgreSQL, reads outbox rows, and delivers them to
+// the configured [Handler]. Create one with [New] and run it with [Relay.Start].
 type Relay struct {
 	dsn     string
 	handler Handler
@@ -121,6 +136,8 @@ type Relay struct {
 	health  *healthServer
 }
 
+// New creates a Relay that will connect to dsn and deliver outbox messages to
+// handler. Call [Relay.Start] to begin processing.
 func New(dsn string, handler Handler, cfg Config) *Relay {
 	cfg.setDefaults()
 	r := &Relay{dsn: dsn, handler: wrap(handler, cfg.Middlewares), cfg: cfg}
@@ -130,6 +147,10 @@ func New(dsn string, handler Handler, cfg Config) *Relay {
 	return r
 }
 
+// Start connects to PostgreSQL and begins delivering outbox messages to the
+// handler. It blocks until ctx is cancelled, reconnecting automatically on
+// transient errors with exponential back-off. The returned error is always
+// the context's cancellation cause.
 func (r *Relay) Start(ctx context.Context) error {
 	if r.health != nil {
 		go func() {

@@ -25,6 +25,7 @@ type config struct {
 	system string
 }
 
+// Option configures the [Tracing] and [Metrics] middlewares.
 type Option func(*config)
 
 // WithTracerProvider overrides the TracerProvider. Defaults to otel.GetTracerProvider().
