@@ -33,6 +33,13 @@ That's it. Plug it in and start relaying:
 relay := outboxd.New(databaseURL, handler, outboxd.Config{
     SlotName:     "outbox_relay",
     Publications: []string{"outbox_pub"},
+    Schema: outboxd.SchemaConfig{
+        Table:           "outbox",
+        IDColumn:        "id",
+        TopicColumn:     "topic",
+        PayloadColumn:   "payload",
+        CreatedAtColumn: "created_at",
+    },
 })
 
 relay.Start(ctx)
@@ -67,6 +74,13 @@ import (
 relay := outboxd.New(databaseURL, handler, outboxd.Config{
     SlotName:     "outbox_relay",
     Publications: []string{"outbox_pub"},
+    Schema: outboxd.SchemaConfig{
+        Table:           "outbox",
+        IDColumn:        "id",
+        TopicColumn:     "topic",
+        PayloadColumn:   "payload",
+        CreatedAtColumn: "created_at",
+    },
     Middlewares: []outboxd.Middleware{
         middleware.Recover(), // place first so it also catches panics from later middleware
     },
@@ -102,6 +116,13 @@ import (
 relay := outboxd.New(databaseURL, handler, outboxd.Config{
     SlotName:     "outbox_relay",
     Publications: []string{"outbox_pub"},
+    Schema: outboxd.SchemaConfig{
+        Table:           "outbox",
+        IDColumn:        "id",
+        TopicColumn:     "topic",
+        PayloadColumn:   "payload",
+        CreatedAtColumn: "created_at",
+    },
     Middlewares: []outboxd.Middleware{
         middleware.Recover(),
         otel.Tracing(),
@@ -126,6 +147,13 @@ otel.Metrics(otel.WithMeterProvider(mp), otel.WithMessagingSystem("kafka"))
 ```go
 relay := outboxd.New(databaseURL, handler, outboxd.Config{
     HealthAddr: ":8080",
+    Schema: outboxd.SchemaConfig{
+        Table:           "outbox",
+        IDColumn:        "id",
+        TopicColumn:     "topic",
+        PayloadColumn:   "payload",
+        CreatedAtColumn: "created_at",
+    },
 })
 ```
 
@@ -159,7 +187,78 @@ CREATE TABLE outbox (
 CREATE PUBLICATION outbox_pub FOR TABLE outbox WITH (publish = 'insert');
 ```
 
-Column names and table name are configurable via `SchemaConfig`.
+Column names, table name, and the column set itself are configurable via `SchemaConfig`:
+
+```go
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    Schema: outboxd.SchemaConfig{
+        Table:           "domain_events",
+        IDColumn:        "event_id",
+        TopicColumn:     "event_type",
+        PayloadColumn:   "data",
+        CreatedAtColumn: "inserted_at",
+    },
+})
+```
+
+### Optional columns
+
+`topic` and `created_at` can be disabled entirely by setting their column name to `"-"`. This lets the relay work with minimal tables that only have an ID and payload:
+
+```sql
+CREATE TABLE outbox (
+    id      BIGSERIAL PRIMARY KEY,
+    payload BYTEA NOT NULL
+);
+```
+
+```go
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    Schema: outboxd.SchemaConfig{
+        Table:           "outbox",
+        IDColumn:        "id",
+        PayloadColumn:   "payload",
+        TopicColumn:     "-",
+        CreatedAtColumn: "-",
+    },
+})
+```
+
+When disabled, `msg.Topic` is `""` and `msg.CreatedAt` is the zero value.
+
+### Extra columns
+
+If your outbox table has additional columns beyond the standard four, declare them in `ExtraColumns` to have the relay read them into `msg.Extras`:
+
+```sql
+CREATE TABLE outbox (
+    id            BIGSERIAL PRIMARY KEY,
+    topic         TEXT NOT NULL,
+    payload       BYTEA NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    aggregate_id  TEXT NOT NULL,
+    partition_key TEXT NOT NULL
+);
+```
+
+```go
+relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    Schema: outboxd.SchemaConfig{
+        Table:           "outbox",
+        IDColumn:        "id",
+        TopicColumn:     "topic",
+        PayloadColumn:   "payload",
+        CreatedAtColumn: "created_at",
+        ExtraColumns:    []string{"aggregate_id", "partition_key"},
+    },
+})
+```
+
+Extra column values are available as `msg.Extras["aggregate_id"]`, `msg.Extras["partition_key"]`, etc. The map is `nil` when no extra columns are configured (zero overhead for the default case). Values receive their natural Go types from pgx (`string` for `TEXT`, `int64` for `BIGINT`, etc.).
+
+### Payload type flexibility
+
+The `payload` column can be `BYTEA`, `TEXT`, or `JSONB` — all three scan into `msg.Payload` (`[]byte`) transparently.
 
 ## First start and pre-existing rows
 
@@ -179,6 +278,13 @@ If logical replication is not available (e.g. managed PostgreSQL without `wal_le
 
 ```go
 relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    Schema: outboxd.SchemaConfig{
+        Table:           "outbox",
+        IDColumn:        "id",
+        TopicColumn:     "topic",
+        PayloadColumn:   "payload",
+        CreatedAtColumn: "created_at",
+    },
     Polling: &outboxd.PollingConfig{
         PollInterval: 500 * time.Millisecond,
         BatchSize:    100,
@@ -204,6 +310,13 @@ CREATE TRIGGER outbox_notify_trigger
 
 ```go
 relay := outboxd.New(databaseURL, handler, outboxd.Config{
+    Schema: outboxd.SchemaConfig{
+        Table:           "outbox",
+        IDColumn:        "id",
+        TopicColumn:     "topic",
+        PayloadColumn:   "payload",
+        CreatedAtColumn: "created_at",
+    },
     Polling: &outboxd.PollingConfig{
         PollInterval:  10 * time.Second,
         BatchSize:     100,

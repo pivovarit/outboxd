@@ -20,6 +20,7 @@ type Message struct {
 	Topic     string
 	Payload   []byte
 	CreatedAt time.Time
+	Extras    map[string]any
 }
 
 // Handler processes a single outbox message. Returning a non-nil error
@@ -32,6 +33,8 @@ type Handler func(ctx context.Context, msg Message) error
 // the user's handler without changing its signature.
 type Middleware func(Handler) Handler
 
+const columnDisabled = "-"
+
 // SchemaConfig maps the outbox table and column names. All fields default
 // to the conventional names ("outbox", "id", "topic", "payload", "created_at")
 // when left empty.
@@ -41,6 +44,7 @@ type SchemaConfig struct {
 	TopicColumn     string
 	PayloadColumn   string
 	CreatedAtColumn string
+	ExtraColumns    []string
 }
 
 func (s SchemaConfig) tableIdent() pgx.Identifier {
@@ -48,6 +52,13 @@ func (s SchemaConfig) tableIdent() pgx.Identifier {
 		return pgx.Identifier{ns, name}
 	}
 	return pgx.Identifier{s.Table}
+}
+
+func (s SchemaConfig) topicEnabled() bool {
+	return s.TopicColumn != "" && s.TopicColumn != columnDisabled
+}
+func (s SchemaConfig) createdAtEnabled() bool {
+	return s.CreatedAtColumn != "" && s.CreatedAtColumn != columnDisabled
 }
 
 // PollingConfig enables poll-based delivery instead of WAL replication.
@@ -96,21 +107,6 @@ func (c *Config) setDefaults() {
 	if c.RetryDelay == 0 {
 		c.RetryDelay = time.Second
 	}
-	if c.Schema.Table == "" {
-		c.Schema.Table = "outbox"
-	}
-	if c.Schema.IDColumn == "" {
-		c.Schema.IDColumn = "id"
-	}
-	if c.Schema.TopicColumn == "" {
-		c.Schema.TopicColumn = "topic"
-	}
-	if c.Schema.PayloadColumn == "" {
-		c.Schema.PayloadColumn = "payload"
-	}
-	if c.Schema.CreatedAtColumn == "" {
-		c.Schema.CreatedAtColumn = "created_at"
-	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
@@ -124,6 +120,25 @@ func (c *Config) setDefaults() {
 		if c.Polling.BatchSize == 0 {
 			c.Polling.BatchSize = 100
 		}
+	}
+	if len(c.Schema.ExtraColumns) > 0 {
+		core := map[string]struct{}{
+			c.Schema.IDColumn:      {},
+			c.Schema.PayloadColumn: {},
+		}
+		if c.Schema.topicEnabled() {
+			core[c.Schema.TopicColumn] = struct{}{}
+		}
+		if c.Schema.createdAtEnabled() {
+			core[c.Schema.CreatedAtColumn] = struct{}{}
+		}
+		filtered := c.Schema.ExtraColumns[:0]
+		for _, ec := range c.Schema.ExtraColumns {
+			if _, collision := core[ec]; !collision {
+				filtered = append(filtered, ec)
+			}
+		}
+		c.Schema.ExtraColumns = filtered
 	}
 }
 

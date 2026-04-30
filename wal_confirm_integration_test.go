@@ -116,6 +116,13 @@ func startListener(t *testing.T, dsn, slot string) *walListener {
 	cfg := Config{
 		SlotName:     slot,
 		Publications: []string{"outbox_pub"},
+		Schema: SchemaConfig{
+			Table:           "outbox",
+			IDColumn:        "id",
+			TopicColumn:     "topic",
+			PayloadColumn:   "payload",
+			CreatedAtColumn: "created_at",
+		},
 	}
 	cfg.setDefaults()
 	w, err := newWALListener(ctx, dsn, cfg)

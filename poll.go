@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -11,16 +12,19 @@ import (
 )
 
 type pollSource struct {
-	conn          *pgx.Conn
-	deleteConn    *pgx.Conn
-	selectQuery   string
-	deleteQuery   string
-	pollInterval  time.Duration
-	batchSize     int
-	notifyChannel string
-	buffered      []Message
-	batchInFlight atomic.Int32
-	confirmCh     chan struct{}
+	conn             *pgx.Conn
+	deleteConn       *pgx.Conn
+	selectQuery      string
+	deleteQuery      string
+	pollInterval     time.Duration
+	batchSize        int
+	notifyChannel    string
+	buffered         []Message
+	batchInFlight    atomic.Int32
+	confirmCh        chan struct{}
+	topicEnabled     bool
+	createdAtEnabled bool
+	extraColumns     []string
 }
 
 func newPollSource(ctx context.Context, dsn string, cfg Config) (*pollSource, error) {
@@ -55,11 +59,20 @@ func newPollSource(ctx context.Context, dsn string, cfg Config) (*pollSource, er
 
 	id := pgx.Identifier{schema.IDColumn}.Sanitize()
 	tableIdent := schema.tableIdent().Sanitize()
-	selectQuery := fmt.Sprintf("SELECT %s, %s, %s, %s FROM %s ORDER BY %s LIMIT $1",
-		id,
-		pgx.Identifier{schema.TopicColumn}.Sanitize(),
-		pgx.Identifier{schema.PayloadColumn}.Sanitize(),
-		pgx.Identifier{schema.CreatedAtColumn}.Sanitize(),
+
+	cols := []string{id, pgx.Identifier{schema.PayloadColumn}.Sanitize()}
+	if schema.topicEnabled() {
+		cols = append(cols, pgx.Identifier{schema.TopicColumn}.Sanitize())
+	}
+	if schema.createdAtEnabled() {
+		cols = append(cols, pgx.Identifier{schema.CreatedAtColumn}.Sanitize())
+	}
+	for _, ec := range schema.ExtraColumns {
+		cols = append(cols, pgx.Identifier{ec}.Sanitize())
+	}
+
+	selectQuery := fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT $1",
+		strings.Join(cols, ", "),
 		tableIdent,
 		id,
 	)
@@ -70,14 +83,17 @@ func newPollSource(ctx context.Context, dsn string, cfg Config) (*pollSource, er
 	)
 
 	return &pollSource{
-		conn:          conn,
-		deleteConn:    deleteConn,
-		selectQuery:   selectQuery,
-		deleteQuery:   deleteQuery,
-		pollInterval:  cfg.Polling.PollInterval,
-		batchSize:     cfg.Polling.BatchSize,
-		notifyChannel: cfg.Polling.NotifyChannel,
-		confirmCh:     make(chan struct{}, 1),
+		conn:             conn,
+		deleteConn:       deleteConn,
+		selectQuery:      selectQuery,
+		deleteQuery:      deleteQuery,
+		pollInterval:     cfg.Polling.PollInterval,
+		batchSize:        cfg.Polling.BatchSize,
+		notifyChannel:    cfg.Polling.NotifyChannel,
+		confirmCh:        make(chan struct{}, 1),
+		topicEnabled:     schema.topicEnabled(),
+		createdAtEnabled: schema.createdAtEnabled(),
+		extraColumns:     schema.ExtraColumns,
 	}, nil
 }
 
@@ -105,9 +121,29 @@ func (p *pollSource) Next(ctx context.Context) (Message, int, error) {
 		var messages []Message
 		for rows.Next() {
 			var msg Message
-			if err := rows.Scan(&msg.ID, &msg.Topic, &msg.Payload, &msg.CreatedAt); err != nil {
+			dests := []any{&msg.ID, &msg.Payload}
+			if p.topicEnabled {
+				dests = append(dests, &msg.Topic)
+			}
+			if p.createdAtEnabled {
+				dests = append(dests, &msg.CreatedAt)
+			}
+			var extraVals []any
+			if len(p.extraColumns) > 0 {
+				extraVals = make([]any, len(p.extraColumns))
+				for i := range extraVals {
+					dests = append(dests, &extraVals[i])
+				}
+			}
+			if err := rows.Scan(dests...); err != nil {
 				rows.Close()
 				return Message{}, 0, fmt.Errorf("outbox: poll scan: %w", err)
+			}
+			if len(p.extraColumns) > 0 {
+				msg.Extras = make(map[string]any, len(p.extraColumns))
+				for i, ec := range p.extraColumns {
+					msg.Extras[ec] = extraVals[i]
+				}
 			}
 			messages = append(messages, msg)
 		}
