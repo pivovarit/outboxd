@@ -273,7 +273,7 @@ func (r *Relay) run(ctx context.Context, src source) error {
 		if err := src.Confirm(c, pending...); err != nil {
 			return err
 		}
-		pending = nil
+		pending = pending[:0]
 		return nil
 	}
 
