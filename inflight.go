@@ -70,11 +70,19 @@ func (t *inFlightTracker) Apply(ids []int64) (pglogrepl.LSN, bool) {
 		delete(t.index, id)
 	}
 	advanced := false
-	for len(t.batches) > 0 && len(t.batches[0].pending) == 0 {
-		t.confirmedLSN = t.batches[0].lsn
-		t.batches[0] = nil
-		t.batches = t.batches[1:]
+	drained := 0
+	for len(t.batches) > drained && len(t.batches[drained].pending) == 0 {
+		t.confirmedLSN = t.batches[drained].lsn
+		t.batches[drained] = nil
+		drained++
 		advanced = true
+	}
+	if drained > 0 {
+		n := copy(t.batches, t.batches[drained:])
+		for i := n; i < len(t.batches); i++ {
+			t.batches[i] = nil
+		}
+		t.batches = t.batches[:n]
 	}
 	return t.confirmedLSN, advanced
 }
