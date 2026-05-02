@@ -165,10 +165,12 @@ func (p *pollSource) Next(ctx context.Context) (Message, int, error) {
 
 func (p *pollSource) waitForActivity(ctx context.Context) error {
 	if p.notifyChannel == "" {
+		timer := time.NewTimer(p.pollInterval)
+		defer timer.Stop()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(p.pollInterval):
+		case <-timer.C:
 			return nil
 		}
 	}
