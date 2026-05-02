@@ -118,22 +118,37 @@ func (p *pollSource) Next(ctx context.Context) (Message, int, error) {
 			return Message{}, 0, fmt.Errorf("outbox: poll query: %w", err)
 		}
 
+		destsLen := 2
+		if p.topicEnabled {
+			destsLen++
+		}
+		if p.createdAtEnabled {
+			destsLen++
+		}
+		destsLen += len(p.extraColumns)
+		dests := make([]any, destsLen)
+		extraVals := make([]any, len(p.extraColumns))
+
 		var messages []Message
 		for rows.Next() {
 			var msg Message
-			dests := []any{&msg.ID, &msg.Payload}
+			i := 0
+			dests[i] = &msg.ID
+			i++
+			dests[i] = &msg.Payload
+			i++
 			if p.topicEnabled {
-				dests = append(dests, &msg.Topic)
+				dests[i] = &msg.Topic
+				i++
 			}
 			if p.createdAtEnabled {
-				dests = append(dests, &msg.CreatedAt)
+				dests[i] = &msg.CreatedAt
+				i++
 			}
-			var extraVals []any
-			if len(p.extraColumns) > 0 {
-				extraVals = make([]any, len(p.extraColumns))
-				for i := range extraVals {
-					dests = append(dests, &extraVals[i])
-				}
+			for j := range extraVals {
+				extraVals[j] = nil
+				dests[i] = &extraVals[j]
+				i++
 			}
 			if err := rows.Scan(dests...); err != nil {
 				rows.Close()
