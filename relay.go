@@ -294,7 +294,7 @@ func (r *Relay) run(ctx context.Context, src source) error {
 		case err := <-nextErrCh:
 			return err
 		case nr := <-msgCh:
-			r.cfg.Logger.Info("outbox: message received", "id", nr.msg.ID, "topic", nr.msg.Topic)
+			r.cfg.Logger.Debug("outbox: message received", "id", nr.msg.ID, "topic", nr.msg.Topic)
 			if err := r.deliverWithRetry(ctx, nr.msg); err != nil {
 				return err
 			}
@@ -350,7 +350,7 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 			continue
 		}
 
-		r.cfg.Logger.Info("outbox: message delivered", "id", msg.ID, "topic", msg.Topic)
+		r.cfg.Logger.Debug("outbox: message delivered", "id", msg.ID, "topic", msg.Topic)
 		return nil
 	}
 }
