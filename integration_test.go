@@ -1919,3 +1919,254 @@ func TestIntegration_Polling_JSONBPayload(t *testing.T) {
 		}
 	}
 }
+
+func setupOutboxJSONPayload(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id         BIGSERIAL PRIMARY KEY,
+			topic      TEXT NOT NULL,
+			payload    JSON NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+}
+
+func setupOutboxJSONPayloadWAL(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id         BIGSERIAL PRIMARY KEY,
+			topic      TEXT NOT NULL,
+			payload    JSON NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	_, err = conn.Exec(ctx, "CREATE PUBLICATION outbox_pub FOR TABLE outbox")
+	if err != nil {
+		t.Fatalf("create publication: %v", err)
+	}
+}
+
+func setupOutboxJSONBPayloadWAL(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id         BIGSERIAL PRIMARY KEY,
+			topic      TEXT NOT NULL,
+			payload    JSONB NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	_, err = conn.Exec(ctx, "CREATE PUBLICATION outbox_pub FOR TABLE outbox")
+	if err != nil {
+		t.Fatalf("create publication: %v", err)
+	}
+}
+
+func TestIntegration_Polling_JSONPayload(t *testing.T) {
+	dsn, cleanup := startPostgresWithoutWAL(t)
+	defer cleanup()
+	setupOutboxJSONPayload(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		RetryDelay: 10 * time.Millisecond,
+		Schema:     defaultSchema,
+		Polling:    &outboxd.PollingConfig{PollInterval: 100 * time.Millisecond},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertTextPayloadRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		want := fmt.Sprintf(`{"index":%d}`, i)
+		if string(msg.Payload) != want {
+			t.Errorf("message[%d]: payload = %q, want %q", i, string(msg.Payload), want)
+		}
+	}
+}
+
+func TestIntegration_WAL_JSONPayload(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+	setupOutboxJSONPayloadWAL(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		SlotName:     "test_slot_json_payload",
+		Publications: []string{"outbox_pub"},
+		RetryDelay:   10 * time.Millisecond,
+		Schema:       defaultSchema,
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertTextPayloadRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		want := fmt.Sprintf(`{"index":%d}`, i)
+		if string(msg.Payload) != want {
+			t.Errorf("message[%d]: payload = %q, want %q", i, string(msg.Payload), want)
+		}
+	}
+}
+
+func TestIntegration_WAL_JSONBPayload(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+	setupOutboxJSONBPayloadWAL(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		SlotName:     "test_slot_jsonb_payload",
+		Publications: []string{"outbox_pub"},
+		RetryDelay:   10 * time.Millisecond,
+		Schema:       defaultSchema,
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	insertTextPayloadRows(t, dsn, 3)
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(received))
+	}
+	for i, msg := range received {
+		if len(msg.Payload) == 0 {
+			t.Errorf("message[%d]: payload is empty", i)
+		}
+	}
+}
