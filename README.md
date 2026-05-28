@@ -1,6 +1,8 @@
 # outboxd
 
-> **Note:** This project is a work in progress and is not yet production-ready.
+[![CI](https://github.com/pivovarit/outboxd/actions/workflows/ci.yml/badge.svg)](https://github.com/pivovarit/outboxd/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/pivovarit/outboxd.svg)](https://pkg.go.dev/github.com/pivovarit/outboxd)
+[![Go Report Card](https://goreportcard.com/badge/github.com/pivovarit/outboxd)](https://goreportcard.com/report/github.com/pivovarit/outboxd)
 
 A lightweight low-latency outbox event relay powered by PostgreSQL logical replication - bridging the gap between naive polling and full-blown CDC solutions like Debezium.
 
