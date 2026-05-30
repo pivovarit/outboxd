@@ -277,7 +277,7 @@ func (w *walListener) readLoop() {
 				}
 				batch := walBatch{messages: pending, lsn: txLSN}
 				pending = nil
-				delivered, dErr := w.deliverBatch(batch, &nextStandby)
+				delivered, dErr := w.registerAndDeliver(batch, &nextStandby)
 				if dErr != nil {
 					w.emitErr(dErr)
 					return
@@ -288,6 +288,22 @@ func (w *walListener) readLoop() {
 			}
 		}
 	}
+}
+
+// registerAndDeliver records the batch with the in-flight tracker and then
+// hands it to the consumer. Registration happens on the readLoop goroutine,
+// strictly before the batch becomes observable and before readLoop processes
+// any subsequent commit, so a following empty commit's AdvanceIdle can never
+// advance confirmedLSN past this still-undelivered batch.
+func (w *walListener) registerAndDeliver(batch walBatch, nextStandby *time.Time) (bool, error) {
+	ids := make([]int64, len(batch.messages))
+	for i, m := range batch.messages {
+		ids[i] = m.ID
+	}
+	w.mu.Lock()
+	w.tracker.Register(batch.lsn, ids)
+	w.mu.Unlock()
+	return w.deliverBatch(batch, nextStandby)
 }
 
 func (w *walListener) deliverBatch(batch walBatch, nextStandby *time.Time) (bool, error) {
@@ -334,13 +350,6 @@ func (w *walListener) Next(ctx context.Context) (Message, int, error) {
 		if !ok {
 			return Message{}, 0, errWALClosed
 		}
-		w.mu.Lock()
-		ids := make([]int64, len(batch.messages))
-		for i, m := range batch.messages {
-			ids[i] = m.ID
-		}
-		w.tracker.Register(batch.lsn, ids)
-		w.mu.Unlock()
 		if len(batch.messages) > 1 {
 			w.buffered = batch.messages[1:]
 		}

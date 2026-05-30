@@ -165,6 +165,21 @@ func TestTracker_AdvanceIdleWorksAfterAllBatchesDrained(t *testing.T) {
 	}
 }
 
+func TestTracker_ApplyDoesNotRegressConfirmedLSN(t *testing.T) {
+	tr := newInFlightTracker()
+	tr.Register(pglogrepl.LSN(200), []int64{1})
+	tr.confirmedLSN = pglogrepl.LSN(250)
+
+	lsn, advanced := tr.Apply([]int64{1})
+
+	if !advanced {
+		t.Fatal("expected advanced=true when head batch fully drained")
+	}
+	if lsn != pglogrepl.LSN(250) || tr.ConfirmedLSN() != pglogrepl.LSN(250) {
+		t.Errorf("Apply regressed confirmedLSN to %v (want 250)", tr.ConfirmedLSN())
+	}
+}
+
 func TestTracker_ApplyCrossBatch(t *testing.T) {
 	tr := newInFlightTracker()
 	tr.Register(pglogrepl.LSN(100), []int64{1, 2, 3})
