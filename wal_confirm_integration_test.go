@@ -4,12 +4,14 @@ package outboxd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -351,6 +353,46 @@ func TestIntegration_WAL_IdleNonInsertTrafficAdvancesLSN(t *testing.T) {
 	}
 	if slotLSN := slotConfirmedLSN(t, dsn, slot); slotLSN <= lsnAfterConfirm {
 		t.Errorf("expected slot confirmed_flush_lsn to advance beyond %v, got %v", lsnAfterConfirm, slotLSN)
+	}
+}
+
+func TestIntegration_WAL_SurfacesWalsenderErrorMidStream(t *testing.T) {
+	dsn, cleanup := startPG(t)
+	defer cleanup()
+	setupOutboxTable(t, dsn)
+
+	cfg := Config{
+		SlotName:     "test_slot_walsender_error",
+		Publications: []string{"no_such_pub"},
+		Schema: SchemaConfig{
+			Table:           "outbox",
+			IDColumn:        "id",
+			TopicColumn:     "topic",
+			PayloadColumn:   "payload",
+			CreatedAtColumn: "created_at",
+		},
+	}
+	cfg.setDefaults()
+	w, err := newWALListener(context.Background(), dsn, cfg)
+	if err != nil {
+		t.Fatalf("newWALListener: %v", err)
+	}
+	defer w.Close(context.Background())
+
+	insertOneTx(t, dsn, "a")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, _, err = w.Next(ctx)
+	if err == nil {
+		t.Fatal("Next returned a message; expected walsender error")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("Next hung until deadline: walsender ErrorResponse was silently dropped")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected *pgconn.PgError in chain, got: %v", err)
 	}
 }
 
