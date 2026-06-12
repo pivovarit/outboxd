@@ -254,6 +254,36 @@ func TestIntegration_WAL_OutOfOrderConfirmDoesNotAdvance(t *testing.T) {
 	}
 }
 
+func TestIntegration_WAL_CleanRestartDoesNotRedeliverConfirmedTx(t *testing.T) {
+	dsn, cleanup := startPG(t)
+	defer cleanup()
+	setupOutboxTable(t, dsn)
+
+	const slot = "test_slot_restart_no_redeliver"
+	w1 := startListener(t, dsn, slot)
+
+	idA := insertOneTx(t, dsn, "a")
+	batchA := drainBatch(t, w1)
+	if len(batchA) != 1 || batchA[0] != idA {
+		t.Fatalf("batch A mismatch: got %v want [%d]", batchA, idA)
+	}
+
+	ctx := context.Background()
+	if err := w1.Confirm(ctx, idA); err != nil {
+		t.Fatalf("Confirm A: %v", err)
+	}
+	w1.Close(ctx)
+
+	w2 := startListener(t, dsn, slot)
+	defer w2.Close(ctx)
+
+	idB := insertOneTx(t, dsn, "b")
+	batch := drainBatch(t, w2)
+	if len(batch) != 1 || batch[0] != idB {
+		t.Fatalf("confirmed tx redelivered after clean restart: got %v want [%d]", batch, idB)
+	}
+}
+
 func TestIntegration_WAL_ConfirmUnknownIDPanics(t *testing.T) {
 	dsn, cleanup := startPG(t)
 	defer cleanup()
