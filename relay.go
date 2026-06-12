@@ -328,6 +328,11 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 		}
 
 		if err := r.handler(ctx, msg); err != nil {
+			// A failure caused by shutdown is not a real attempt: dropping here
+			// would let the deferred flush delete a message that was never handled.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if r.cfg.MaxRetries > 0 && retries >= r.cfg.MaxRetries {
 				r.cfg.Logger.Error("outbox: message dropped",
 					"id", msg.ID, "attempts", retries+1, "err", err)

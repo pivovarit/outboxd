@@ -76,6 +76,111 @@ func DropSlot(ctx context.Context, dsn string, slotName string) error {
 	return nil
 }
 
+// validateWALConfig checks the configured table, columns, and publications
+// against the live catalog before any replication state is created. A typo'd
+// or case-mismatched name is otherwise silent: the WAL filter matches nothing
+// and the slot is confirmed past real rows, or rows arrive with nil payloads
+// or zero IDs and are deleted on confirm.
+func validateWALConfig(ctx context.Context, conn *pgx.Conn, cfg Config) error {
+	schema := cfg.Schema
+	if schema.Table == "" {
+		return errors.New("outbox: SchemaConfig.Table is required")
+	}
+	if schema.IDColumn == "" || schema.IDColumn == columnDisabled {
+		return errors.New("outbox: SchemaConfig.IDColumn is required")
+	}
+	if schema.PayloadColumn == "" || schema.PayloadColumn == columnDisabled {
+		return errors.New("outbox: SchemaConfig.PayloadColumn is required")
+	}
+	if len(cfg.Publications) == 0 {
+		return errors.New("outbox: Config.Publications is required for WAL mode")
+	}
+
+	tableName := schema.tableIdent().Sanitize()
+
+	var nspname, relname string
+	err := conn.QueryRow(ctx, `
+		SELECT n.nspname, c.relname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = to_regclass($1)`, tableName).Scan(&nspname, &relname)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("outbox: table %s does not exist", tableName)
+	}
+	if err != nil {
+		return fmt.Errorf("outbox: resolve table %s: %w", tableName, err)
+	}
+
+	rows, err := conn.Query(ctx, `
+		SELECT attname
+		FROM pg_attribute
+		WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped`, tableName)
+	if err != nil {
+		return fmt.Errorf("outbox: list columns of %s: %w", tableName, err)
+	}
+	cols, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("outbox: list columns of %s: %w", tableName, err)
+	}
+	existing := make(map[string]struct{}, len(cols))
+	for _, c := range cols {
+		existing[c] = struct{}{}
+	}
+
+	required := []string{schema.IDColumn, schema.PayloadColumn}
+	if schema.topicEnabled() {
+		required = append(required, schema.TopicColumn)
+	}
+	if schema.createdAtEnabled() {
+		required = append(required, schema.CreatedAtColumn)
+	}
+	required = append(required, schema.ExtraColumns...)
+
+	var missing []string
+	for _, col := range required {
+		if _, ok := existing[col]; !ok {
+			missing = append(missing, col)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("outbox: table %s is missing configured columns: %s",
+			tableName, strings.Join(missing, ", "))
+	}
+
+	covered := false
+	for _, pub := range cfg.Publications {
+		var pubinsert bool
+		err := conn.QueryRow(ctx,
+			"SELECT pubinsert FROM pg_publication WHERE pubname = $1", pub).Scan(&pubinsert)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("outbox: publication %q does not exist", pub)
+		}
+		if err != nil {
+			return fmt.Errorf("outbox: check publication %q: %w", pub, err)
+		}
+		var includes bool
+		err = conn.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_publication_tables
+				WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)`,
+			pub, nspname, relname).Scan(&includes)
+		if err != nil {
+			return fmt.Errorf("outbox: check publication %q tables: %w", pub, err)
+		}
+		if !includes {
+			continue
+		}
+		if !pubinsert {
+			return fmt.Errorf("outbox: publication %q does not publish inserts for table %s", pub, tableName)
+		}
+		covered = true
+	}
+	if !covered {
+		return fmt.Errorf("outbox: no configured publication includes table %s", tableName)
+	}
+	return nil
+}
+
 func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, error) {
 	replCfg, err := pgconn.ParseConfig(dsn)
 	if err != nil {
@@ -91,6 +196,12 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 	if err != nil {
 		_ = replConn.Close(ctx)
 		return nil, fmt.Errorf("outbox: db connect: %w", err)
+	}
+
+	if err := validateWALConfig(ctx, dbConn, cfg); err != nil {
+		_ = replConn.Close(ctx)
+		_ = dbConn.Close(ctx)
+		return nil, err
 	}
 
 	var active *bool
@@ -211,8 +322,12 @@ func (w *walListener) readLoop() {
 			continue
 		}
 
-		cd, ok := rawMsg.(*pgproto3.CopyData)
-		if !ok {
+		cd, mErr := extractCopyData(rawMsg)
+		if mErr != nil {
+			w.emitErr(mErr)
+			return
+		}
+		if cd == nil {
 			continue
 		}
 
@@ -285,6 +400,19 @@ func (w *walListener) readLoop() {
 				}
 			}
 		}
+	}
+}
+
+func extractCopyData(rawMsg pgproto3.BackendMessage) (*pgproto3.CopyData, error) {
+	switch m := rawMsg.(type) {
+	case *pgproto3.CopyData:
+		return m, nil
+	case *pgproto3.ErrorResponse:
+		return nil, fmt.Errorf("outbox: walsender error: %w", pgconn.ErrorResponseToPgError(m))
+	case *pgproto3.CopyDone:
+		return nil, errors.New("outbox: walsender ended COPY mode, replication stream closed")
+	default:
+		return nil, nil
 	}
 }
 
