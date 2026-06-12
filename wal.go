@@ -322,8 +322,12 @@ func (w *walListener) readLoop() {
 			continue
 		}
 
-		cd, ok := rawMsg.(*pgproto3.CopyData)
-		if !ok {
+		cd, mErr := extractCopyData(rawMsg)
+		if mErr != nil {
+			w.emitErr(mErr)
+			return
+		}
+		if cd == nil {
 			continue
 		}
 
@@ -396,6 +400,19 @@ func (w *walListener) readLoop() {
 				}
 			}
 		}
+	}
+}
+
+func extractCopyData(rawMsg pgproto3.BackendMessage) (*pgproto3.CopyData, error) {
+	switch m := rawMsg.(type) {
+	case *pgproto3.CopyData:
+		return m, nil
+	case *pgproto3.ErrorResponse:
+		return nil, fmt.Errorf("outbox: walsender error: %w", pgconn.ErrorResponseToPgError(m))
+	case *pgproto3.CopyDone:
+		return nil, errors.New("outbox: walsender ended COPY mode, replication stream closed")
+	default:
+		return nil, nil
 	}
 }
 
