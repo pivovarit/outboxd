@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type pollSource struct {
@@ -129,6 +130,9 @@ func (p *pollSource) Next(ctx context.Context) (Message, int, error) {
 		dests := make([]any, destsLen)
 		extraVals := make([]any, len(p.extraColumns))
 
+		var topic pgtype.Text
+		var createdAt pgtype.Timestamptz
+
 		var messages []Message
 		for rows.Next() {
 			var msg Message
@@ -138,11 +142,11 @@ func (p *pollSource) Next(ctx context.Context) (Message, int, error) {
 			dests[i] = &msg.Payload
 			i++
 			if p.topicEnabled {
-				dests[i] = &msg.Topic
+				dests[i] = &topic
 				i++
 			}
 			if p.createdAtEnabled {
-				dests[i] = &msg.CreatedAt
+				dests[i] = &createdAt
 				i++
 			}
 			for j := range extraVals {
@@ -153,6 +157,12 @@ func (p *pollSource) Next(ctx context.Context) (Message, int, error) {
 			if err := rows.Scan(dests...); err != nil {
 				rows.Close()
 				return Message{}, 0, fmt.Errorf("outbox: poll scan: %w", err)
+			}
+			if p.topicEnabled {
+				msg.Topic = topic.String
+			}
+			if p.createdAtEnabled {
+				msg.CreatedAt = createdAt.Time
 			}
 			if len(p.extraColumns) > 0 {
 				msg.Extras = make(map[string]any, len(p.extraColumns))
