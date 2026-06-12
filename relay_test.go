@@ -191,6 +191,43 @@ func TestRelay_DropsMessageAfterMaxRetries(t *testing.T) {
 	}
 }
 
+func TestRelay_DoesNotDropWhenFinalAttemptCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	attempts := 0
+	handler := func(hCtx context.Context, _ Message) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("transient error")
+		}
+		cancel()
+		return hCtx.Err()
+	}
+
+	dropped := false
+	src := &fakeSource{
+		messages: []Message{{ID: 7, Topic: "test", Payload: []byte("data")}},
+	}
+
+	cfg := Config{
+		RetryDelay: time.Millisecond,
+		MaxRetries: 2,
+		OnDropped:  func(Message, error) { dropped = true },
+	}
+
+	err := startRelayWithFakeSource(ctx, src, handler, cfg)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if dropped {
+		t.Error("message must not be dropped on an attempt aborted by shutdown")
+	}
+	if confirmed := src.confirmedSnapshot(); len(confirmed) != 0 {
+		t.Errorf("expected no confirmations (message must be redelivered after restart), got %v", confirmed)
+	}
+}
+
 func TestRelay_RetriesForeverWhenMaxRetriesZero(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
