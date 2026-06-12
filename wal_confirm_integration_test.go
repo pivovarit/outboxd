@@ -363,7 +363,7 @@ func TestIntegration_WAL_SurfacesWalsenderErrorMidStream(t *testing.T) {
 
 	cfg := Config{
 		SlotName:     "test_slot_walsender_error",
-		Publications: []string{"no_such_pub"},
+		Publications: []string{"outbox_pub"},
 		Schema: SchemaConfig{
 			Table:           "outbox",
 			IDColumn:        "id",
@@ -379,6 +379,7 @@ func TestIntegration_WAL_SurfacesWalsenderErrorMidStream(t *testing.T) {
 	}
 	defer w.Close(context.Background())
 
+	execSQL(t, dsn, "DROP PUBLICATION outbox_pub")
 	insertOneTx(t, dsn, "a")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
