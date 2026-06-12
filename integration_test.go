@@ -2170,3 +2170,116 @@ func TestIntegration_WAL_JSONBPayload(t *testing.T) {
 		}
 	}
 }
+
+func setupOutboxPollingNullable(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE outbox (
+			id         BIGSERIAL PRIMARY KEY,
+			topic      TEXT,
+			payload    BYTEA NOT NULL,
+			created_at TIMESTAMPTZ
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+}
+
+func TestIntegration_Polling_NullTopicAndCreatedAt(t *testing.T) {
+	dsn, cleanup := startPostgresWithoutWAL(t)
+	defer cleanup()
+	setupOutboxPollingNullable(t, dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		received []outboxd.Message
+		done     = make(chan struct{})
+	)
+	handler := func(_ context.Context, msg outboxd.Message) error {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == 2 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	relay := outboxd.New(dsn, handler, outboxd.Config{
+		RetryDelay: 10 * time.Millisecond,
+		Schema:     defaultSchema,
+		Polling:    &outboxd.PollingConfig{PollInterval: 100 * time.Millisecond},
+	})
+
+	relayErr := make(chan error, 1)
+	go func() { relayErr <- relay.Start(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+
+	insertCtx := context.Background()
+	conn, err := pgx.Connect(insertCtx, dsn)
+	if err != nil {
+		t.Fatalf("insert connect: %v", err)
+	}
+	_, err = conn.Exec(insertCtx,
+		`INSERT INTO outbox (topic, payload, created_at) VALUES
+			(NULL, 'payload-null'::bytea, NULL),
+			('orders', 'payload-ok'::bytea, now())`)
+	conn.Close(insertCtx)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	select {
+	case <-done:
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	case <-ctx.Done():
+	}
+	<-relayErr
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(received))
+	}
+	if received[0].Topic != "" {
+		t.Errorf("message[0]: topic = %q, want empty for NULL", received[0].Topic)
+	}
+	if !received[0].CreatedAt.IsZero() {
+		t.Errorf("message[0]: created_at = %v, want zero for NULL", received[0].CreatedAt)
+	}
+	if received[1].Topic != "orders" {
+		t.Errorf("message[1]: topic = %q, want %q", received[1].Topic, "orders")
+	}
+	if received[1].CreatedAt.IsZero() {
+		t.Errorf("message[1]: created_at is zero, want non-zero")
+	}
+
+	verifyCtx := context.Background()
+	vconn, err := pgx.Connect(verifyCtx, dsn)
+	if err != nil {
+		t.Fatalf("verify connect: %v", err)
+	}
+	defer vconn.Close(verifyCtx)
+	var count int
+	if err := vconn.QueryRow(verifyCtx, "SELECT COUNT(*) FROM outbox").Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected outbox to be empty after delivery, got %d rows", count)
+	}
+}
