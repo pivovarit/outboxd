@@ -181,7 +181,6 @@ func (w *walListener) readLoop() {
 	defer close(w.readDone)
 
 	var pending []Message
-	var txLSN pglogrepl.LSN
 	nextStandby := time.Now().Add(w.standbyInterval)
 
 	for {
@@ -250,7 +249,6 @@ func (w *walListener) readLoop() {
 
 			switch m := logicalMsg.(type) {
 			case *pglogrepl.BeginMessage:
-				txLSN = m.FinalLSN
 				pending = nil
 			case *pglogrepl.RelationMessage:
 				w.relations[m.RelationID] = m
@@ -271,11 +269,11 @@ func (w *walListener) readLoop() {
 			case *pglogrepl.CommitMessage:
 				if len(pending) == 0 {
 					w.mu.Lock()
-					w.tracker.AdvanceIdle(txLSN)
+					w.tracker.AdvanceIdle(m.TransactionEndLSN)
 					w.mu.Unlock()
 					continue
 				}
-				batch := walBatch{messages: pending, lsn: txLSN}
+				batch := walBatch{messages: pending, lsn: m.TransactionEndLSN}
 				pending = nil
 				delivered, dErr := w.registerAndDeliver(batch, &nextStandby)
 				if dErr != nil {
