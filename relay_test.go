@@ -228,6 +228,82 @@ func TestRelay_DoesNotDropWhenFinalAttemptCancelled(t *testing.T) {
 	}
 }
 
+func TestRelay_FailStopHaltsInsteadOfDropping(t *testing.T) {
+	// The timeout is a hang guard: a correct fail-stop returns well before it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	attempts := 0
+	dropped := false
+	handler := func(_ context.Context, msg Message) error {
+		if msg.ID == 1 {
+			return nil
+		}
+		attempts++
+		return errors.New("permanent error")
+	}
+
+	src := &fakeSource{
+		messages: []Message{
+			{ID: 1, Topic: "ok"},
+			{ID: 2, Topic: "poison"},
+		},
+	}
+
+	cfg := Config{
+		RetryDelay: time.Millisecond,
+		MaxRetries: 2,
+		FailStop:   true,
+		OnDropped:  func(Message, error) { dropped = true },
+	}
+
+	err := startRelayWithFakeSource(ctx, src, handler, cfg)
+
+	if !errors.Is(err, ErrRetriesExhausted) {
+		t.Fatalf("expected ErrRetriesExhausted, got %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("expected 3 attempts (1 initial + 2 retries) before halt, got %d", attempts)
+	}
+	if dropped {
+		t.Error("OnDropped must not fire when FailStop halts the relay")
+	}
+	confirmed := src.confirmedSnapshot()
+	if len(confirmed) != 1 || confirmed[0] != 1 {
+		t.Errorf("expected only id 1 flushed before halt, got %v", confirmed)
+	}
+}
+
+func TestStart_ReturnsTerminalErrorOnFailStop(t *testing.T) {
+	// The timeout is a hang guard: a correct fail-stop returns well before it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	handler := func(_ context.Context, _ Message) error {
+		return errors.New("permanent error")
+	}
+	r := New("dsn-unused", handler, Config{
+		RetryDelay: time.Millisecond,
+		MaxRetries: 1,
+		FailStop:   true,
+	})
+
+	sourcesCreated := 0
+	r.newSource = func(_ context.Context, _ string, _ Config) (source, error) {
+		sourcesCreated++
+		return &fakeSource{messages: []Message{{ID: 1, Topic: "poison"}}}, nil
+	}
+
+	err := r.Start(ctx)
+
+	if !errors.Is(err, ErrRetriesExhausted) {
+		t.Fatalf("expected ErrRetriesExhausted from Start, got %v", err)
+	}
+	if sourcesCreated != 1 {
+		t.Errorf("expected no reconnect after terminal error, got %d source creations", sourcesCreated)
+	}
+}
+
 func TestRelay_RetriesForeverWhenMaxRetriesZero(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -252,6 +328,116 @@ func TestRelay_RetriesForeverWhenMaxRetriesZero(t *testing.T) {
 	}
 	if attempts != 10 {
 		t.Errorf("expected 10 attempts (unlimited retries), got %d", attempts)
+	}
+}
+
+func TestRelay_StatusTracksDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cfg := Config{RetryDelay: time.Millisecond}
+	cfg.setDefaults()
+	r := &Relay{cfg: cfg}
+	r.handler = func(_ context.Context, msg Message) error {
+		if msg.ID == 2 {
+			cancel()
+		}
+		return nil
+	}
+
+	src := &fakeSource{messages: []Message{{ID: 1}, {ID: 2}}}
+	_ = r.run(ctx, src)
+
+	st := r.Status()
+	if st.Delivered != 2 {
+		t.Errorf("expected 2 delivered, got %d", st.Delivered)
+	}
+	if st.LastDeliveredAt.IsZero() {
+		t.Error("expected LastDeliveredAt to be set")
+	}
+	if st.Retrying {
+		t.Error("expected no active retry after clean deliveries")
+	}
+}
+
+func TestRelay_StatusExposesActiveRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := Config{RetryDelay: time.Millisecond}
+	cfg.setDefaults()
+	r := &Relay{cfg: cfg}
+
+	secondAttempt := make(chan struct{})
+	attempts := 0
+	r.handler = func(_ context.Context, _ Message) error {
+		attempts++
+		if attempts == 2 {
+			close(secondAttempt)
+		}
+		return errors.New("permanent error")
+	}
+
+	src := &fakeSource{messages: []Message{{ID: 7, Topic: "poison"}}}
+	done := make(chan struct{})
+	go func() {
+		_ = r.run(ctx, src)
+		close(done)
+	}()
+
+	// Once attempt 2 has started, attempt 1's failure is already recorded.
+	<-secondAttempt
+	st := r.Status()
+	cancel()
+	<-done
+
+	if !st.Retrying {
+		t.Fatal("expected Retrying=true while a message is stuck in retry")
+	}
+	if st.RetryingID != 7 {
+		t.Errorf("expected RetryingID 7, got %d", st.RetryingID)
+	}
+	if st.RetryAttempts < 1 {
+		t.Errorf("expected at least 1 recorded attempt, got %d", st.RetryAttempts)
+	}
+	if st.RetryingSince.IsZero() {
+		t.Error("expected RetryingSince to be set")
+	}
+}
+
+func TestRelay_StatusClearsRetryOnRecoveryAndDrop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cfg := Config{
+		RetryDelay: time.Millisecond,
+		MaxRetries: 2,
+		OnDropped:  func(Message, error) {},
+	}
+	cfg.setDefaults()
+	r := &Relay{cfg: cfg}
+
+	attempts := map[int64]int{}
+	r.handler = func(_ context.Context, msg Message) error {
+		attempts[msg.ID]++
+		switch {
+		case msg.ID == 1 && attempts[1] == 1:
+			return errors.New("transient error") // recovers on attempt 2
+		case msg.ID == 2:
+			return errors.New("permanent error") // dropped after retries
+		case msg.ID == 3:
+			cancel()
+		}
+		return nil
+	}
+
+	src := &fakeSource{messages: []Message{{ID: 1}, {ID: 2}, {ID: 3}}}
+	_ = r.run(ctx, src)
+
+	st := r.Status()
+	if st.Retrying {
+		t.Errorf("expected retry state cleared after recovery and drop, got %+v", st)
+	}
+	if st.Delivered != 2 {
+		t.Errorf("expected 2 delivered (dropped message not counted), got %d", st.Delivered)
 	}
 }
 

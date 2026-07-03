@@ -2,6 +2,8 @@ package outboxd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -11,6 +13,13 @@ import (
 )
 
 const maxRetryDelay = time.Minute
+
+// ErrRetriesExhausted is returned by [Relay.Start] when [Config.FailStop] is
+// set and a message failed all MaxRetries+1 delivery attempts. The failing
+// message is not confirmed: it stays in the outbox and is redelivered when
+// the relay is restarted. The underlying handler error is wrapped and can be
+// inspected with [errors.Unwrap] or [errors.As].
+var ErrRetriesExhausted = errors.New("outbox: message retries exhausted")
 
 const flushTimeout = 5 * time.Second
 
@@ -77,11 +86,24 @@ type Config struct {
 	SlotName     string
 	Publications []string
 	RetryDelay   time.Duration
-	MaxRetries   int
-	OnDropped    func(msg Message, err error)
-	Schema       SchemaConfig
-	Logger       *slog.Logger
-	Polling      *PollingConfig
+	// MaxRetries bounds delivery attempts per message: after 1+MaxRetries
+	// failed attempts the message is resolved (dropped, or halted on if
+	// FailStop is set). 0 means retry forever — delivery stalls on the
+	// failing message and the replication slot retains WAL until it
+	// succeeds, so pair it with slot-lag alerting (see README).
+	MaxRetries int
+	// FailStop halts the relay instead of dropping a message that exhausted
+	// MaxRetries: [Relay.Start] returns an error wrapping
+	// [ErrRetriesExhausted], the message stays unconfirmed, and it is
+	// redelivered after a restart. Ignored when MaxRetries is 0.
+	FailStop bool
+	// OnDropped is invoked after a message exhausts MaxRetries and FailStop
+	// is unset — the last chance to persist it (dead-letter) before the
+	// relay confirms and deletes it.
+	OnDropped func(msg Message, err error)
+	Schema    SchemaConfig
+	Logger    *slog.Logger
+	Polling   *PollingConfig
 	// Middlewares wrap the user handler in the order given. The first element
 	// is outermost: it is entered first and exits last. Retry is applied by
 	// the relay outside the chain, so each retry attempt flows through every
@@ -94,9 +116,12 @@ type Config struct {
 	// wal_sender_timeout (default 60s).
 	KeepaliveInterval time.Duration
 	// HealthAddr, when set, starts an HTTP server exposing /health
-	// (liveness) and /ready (readiness) probe endpoints. The readiness
+	// (liveness) and /ready (readiness) probe endpoints, plus /status,
+	// which reports delivery progress as JSON (see [Status]). The readiness
 	// probe returns 200 only while the relay has an active connection to
-	// PostgreSQL. Example: ":8080".
+	// PostgreSQL; note that a relay stuck retrying a poison message still
+	// reports ready — watch /status or [Relay.Status] for that.
+	// Example: ":8080".
 	HealthAddr string
 }
 
@@ -145,10 +170,13 @@ func (c *Config) setDefaults() {
 // Relay connects to PostgreSQL, reads outbox rows, and delivers them to
 // the configured [Handler]. Create one with [New] and run it with [Relay.Start].
 type Relay struct {
-	dsn     string
-	handler Handler
-	cfg     Config
-	health  *healthServer
+	dsn      string
+	handler  Handler
+	cfg      Config
+	health   *healthServer
+	progress progressTracker
+	// newSource overrides source construction; used by tests to inject fakes.
+	newSource func(ctx context.Context, dsn string, cfg Config) (source, error)
 }
 
 // New creates a Relay that will connect to dsn and deliver outbox messages to
@@ -157,15 +185,17 @@ func New(dsn string, handler Handler, cfg Config) *Relay {
 	cfg.setDefaults()
 	r := &Relay{dsn: dsn, handler: wrap(handler, cfg.Middlewares), cfg: cfg}
 	if cfg.HealthAddr != "" {
-		r.health = newHealthServer(cfg.HealthAddr)
+		r.health = newHealthServer(cfg.HealthAddr, r.Status)
 	}
 	return r
 }
 
 // Start connects to PostgreSQL and begins delivering outbox messages to the
 // handler. It blocks until ctx is cancelled, reconnecting automatically on
-// transient errors with exponential back-off. The returned error is always
-// the context's cancellation cause.
+// transient errors with exponential back-off. The returned error is the
+// context's cancellation cause, or an error wrapping [ErrRetriesExhausted]
+// when [Config.FailStop] halts the relay on a message that exhausted its
+// retries.
 func (r *Relay) Start(ctx context.Context) error {
 	if r.health != nil {
 		go func() {
@@ -184,9 +214,12 @@ func (r *Relay) Start(ctx context.Context) error {
 	for {
 		var src source
 		var err error
-		if r.cfg.Polling != nil {
+		switch {
+		case r.newSource != nil:
+			src, err = r.newSource(ctx, r.dsn, r.cfg)
+		case r.cfg.Polling != nil:
 			src, err = newPollSource(ctx, r.dsn, r.cfg)
-		} else {
+		default:
 			src, err = newWALListener(ctx, r.dsn, r.cfg)
 		}
 		var ranFor time.Duration
@@ -207,6 +240,9 @@ func (r *Relay) Start(ctx context.Context) error {
 
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if errors.Is(err, ErrRetriesExhausted) {
+			return err
 		}
 
 		r.cfg.Logger.Error("outbox: connection error", "err", err, "retry_in", delay)
@@ -334,6 +370,15 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 				return ctx.Err()
 			}
 			if r.cfg.MaxRetries > 0 && retries >= r.cfg.MaxRetries {
+				if r.cfg.FailStop {
+					// Keep the retry state visible: the message is still
+					// unresolved when the relay halts.
+					r.progress.retrying(msg.ID, retries+1, time.Now())
+					r.cfg.Logger.Error("outbox: retries exhausted, halting relay",
+						"id", msg.ID, "attempts", retries+1, "err", err)
+					return fmt.Errorf("%w: message %d: %w", ErrRetriesExhausted, msg.ID, err)
+				}
+				r.progress.resolved()
 				r.cfg.Logger.Error("outbox: message dropped",
 					"id", msg.ID, "attempts", retries+1, "err", err)
 				if r.cfg.OnDropped != nil {
@@ -341,6 +386,7 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 				}
 				return nil
 			}
+			r.progress.retrying(msg.ID, retries+1, time.Now())
 			r.cfg.Logger.Error("outbox: handler error",
 				"id", msg.ID, "attempt", retries+1, "err", err, "retry_in", delay)
 			select {
@@ -355,6 +401,7 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 			continue
 		}
 
+		r.progress.delivered(time.Now())
 		r.cfg.Logger.Debug("outbox: message delivered", "id", msg.ID, "topic", msg.Topic)
 		return nil
 	}

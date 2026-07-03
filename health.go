@@ -2,6 +2,7 @@ package outboxd
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -12,7 +13,7 @@ type healthServer struct {
 	server *http.Server
 }
 
-func newHealthServer(addr string) *healthServer {
+func newHealthServer(addr string, status func() Status) *healthServer {
 	h := &healthServer{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
@@ -23,6 +24,12 @@ func newHealthServer(addr string) *healthServer {
 			w.WriteHeader(http.StatusOK)
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(status()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})
 	h.server = &http.Server{Addr: addr, Handler: mux}

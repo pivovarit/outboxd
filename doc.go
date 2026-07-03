@@ -14,5 +14,7 @@
 //	err := relay.Start(ctx)
 //
 // See the Config type for schema mapping, retry behaviour, polling mode, and
-// middleware options.
+// middleware options. [Relay.Status] exposes delivery progress for
+// monitoring, including whether delivery is blocked retrying a failing
+// message.
 package outboxd

@@ -161,6 +161,9 @@ relay := outboxd.New(databaseURL, handler, outboxd.Config{
 
 - `GET /health` - liveness probe, always returns `200`
 - `GET /ready` - readiness probe, returns `200` while connected to PostgreSQL, `503` otherwise
+- `GET /status` - delivery progress as JSON: total delivered, time of last delivery, and whether delivery is currently blocked retrying a message (and if so, which one, for how long, and how many attempts)
+
+Note that the probes only cover connectivity: a relay stuck retrying a poison message is still alive and connected, so `/health` and `/ready` stay green while no messages flow. `/status` (or `Relay.Status()` in-process) is the signal that catches this - see [Retries and poison messages](#retries-and-poison-messages).
 
 ## Running the example
 
@@ -273,6 +276,57 @@ The `payload` column can be `BYTEA`, `TEXT`, or `JSONB` — all three scan into 
 In WAL mode, messages are delivered in **commit order**, not in `Message.ID` order. If transaction A inserts `id=10` and transaction B inserts `id=11`, but B commits first, the consumer sees `11` before `10`. `Message.ID` is unique and safe to dedupe on, but it is **not** a high-watermark - a downstream that assumes "if I see id=N, I've seen everything < N" will be wrong.
 
 Polling mode observes only rows that are committed when each poll query runs, and orders that visible set by `Message.ID`. This still means `Message.ID` is not a high-watermark: a long-running transaction can allocate `id=10`, another transaction can allocate and commit `id=11`, and a poll between those commits can deliver `11` before `10` is even visible. When the long-running transaction later commits, `10` is picked up by a later poll or `NotifyChannel` wakeup.
+
+## Retries and poison messages
+
+When the handler returns an error, the relay retries the message with exponential backoff (starting at `RetryDelay`, capped at one minute). Messages are delivered serially, so a message that keeps failing blocks everything behind it. What happens next is a policy decision, controlled by `MaxRetries` and `FailStop`:
+
+| Config | Behaviour | Trade-off |
+|---|---|---|
+| `MaxRetries: 0` (default) | Retry forever | Nothing is ever lost, but a poison message stalls delivery indefinitely |
+| `MaxRetries: N` | Drop after 1+N attempts, invoking `OnDropped` | Delivery keeps flowing, but the message is deleted - persist it in `OnDropped` (dead-letter table, log, alert) or it is gone |
+| `MaxRetries: N, FailStop: true` | Halt: `Start` returns an error wrapping `ErrRetriesExhausted` | Nothing is lost and the failure is loud, but the relay stops until restarted; the message is redelivered then |
+
+This mirrors PostgreSQL's own logical replication: a subscription retries a failing transaction forever by default, `disable_on_error` is its fail-stop, and `ALTER SUBSCRIPTION ... SKIP` is its manual drop.
+
+### If you keep the default, alert on slot lag
+
+`MaxRetries: 0` is the safe default for data integrity, but it turns a poison message into a silent operational hazard in WAL mode: while delivery is stalled the replication slot stops advancing, and PostgreSQL retains all WAL the slot has not confirmed - **unbounded disk growth on the primary**, while `/health` and `/ready` stay green. A relay running the default **must** be paired with slot-lag alerting:
+
+```sql
+SELECT slot_name,
+       wal_status,
+       safe_wal_size,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS retained_wal
+FROM pg_replication_slots
+WHERE slot_name = 'outbox_relay';
+```
+
+Alert when `retained_wal` grows past what your disk can absorb, or when `wal_status` leaves `reserved`. On the relay side, `GET /status` reports the stall directly: `retrying: true` with a `retrying_since` timestamp that keeps aging while `delivered` stands still.
+
+As a last line of defense, cap how much WAL a stalled slot can pin:
+
+```sql
+ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
+```
+
+When the cap is exceeded PostgreSQL invalidates the slot instead of filling the disk - the primary survives, but the relay's WAL stream is gone. Undelivered rows still sitting in the outbox table are **not** replayed through a recreated slot (its consistent point is fixed at creation); drain them via polling mode before switching back to WAL mode. That is the trade the cap buys you: a recoverable drain instead of a full primary outage.
+
+### Ejecting a poison message
+
+To skip a message that will never succeed without restarting into a different policy, handle it in the handler - return `nil` for the offending ID (persisting it wherever your dead letters go) and let the relay confirm it:
+
+```go
+handler := func(ctx context.Context, msg outboxd.Message) error {
+    if msg.ID == poisonID {
+        log.Printf("skipping poison message %d", msg.ID)
+        return nil // confirms and deletes the row
+    }
+    return publish(ctx, msg)
+}
+```
+
+Note that in WAL mode, deleting the row from the outbox table does **not** skip it: the INSERT is already in the slot's WAL stream and will still be delivered. Deleting the row only works in polling mode.
 
 ## Polling mode
 
