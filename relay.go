@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -123,12 +122,19 @@ type Config struct {
 	KeepaliveInterval time.Duration
 	// HealthAddr, when set, starts an HTTP server exposing /health
 	// (liveness) and /ready (readiness) probe endpoints, plus /status,
-	// which reports delivery progress as JSON (see [Status]). The readiness
-	// probe returns 200 only while the relay has an active connection to
-	// PostgreSQL; note that a relay stuck retrying a poison message still
-	// reports ready - watch /status or [Relay.Status] for that.
-	// Example: ":8080".
+	// which reports delivery progress as JSON (see [Status]). The server
+	// runs only while [Relay.Start] is running, and Start fails if the
+	// address cannot be bound. The readiness probe returns 200 while the
+	// relay has an active connection to PostgreSQL and delivery is not
+	// stalled (see StalledAfter). Example: ":8080".
 	HealthAddr string
+	// StalledAfter bounds how long the readiness probe tolerates a blocked
+	// delivery: once the same message has been failing and retrying for
+	// this long, /ready flips to 503 so an orchestrator can alert or
+	// restart the relay instead of leaving it wedged silently. 0 uses the
+	// default of 5 minutes; a negative value disables stall detection,
+	// making readiness reflect connectivity only.
+	StalledAfter time.Duration
 }
 
 func (c *Config) setDefaults() {
@@ -143,6 +149,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.KeepaliveInterval == 0 {
 		c.KeepaliveInterval = 5 * time.Second
+	}
+	if c.StalledAfter == 0 {
+		c.StalledAfter = 5 * time.Minute
 	}
 	if c.Polling != nil {
 		if c.Polling.PollInterval == 0 {
@@ -191,7 +200,7 @@ func New(dsn string, handler Handler, cfg Config) *Relay {
 	cfg.setDefaults()
 	r := &Relay{dsn: dsn, handler: wrap(handler, cfg.Middlewares), cfg: cfg}
 	if cfg.HealthAddr != "" {
-		r.health = newHealthServer(cfg.HealthAddr, r.Status)
+		r.health = newHealthServer(cfg.HealthAddr, r.Status, cfg.StalledAfter, cfg.Logger)
 	}
 	return r
 }
@@ -204,11 +213,9 @@ func New(dsn string, handler Handler, cfg Config) *Relay {
 // retries.
 func (r *Relay) Start(ctx context.Context) error {
 	if r.health != nil {
-		go func() {
-			if err := r.health.listenAndServe(); err != nil && err != http.ErrServerClosed {
-				r.cfg.Logger.Error("outbox: health server error", "err", err)
-			}
-		}()
+		if err := r.health.start(); err != nil {
+			return fmt.Errorf("outbox: health server: %w", err)
+		}
 		defer func() {
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer shutdownCancel()
