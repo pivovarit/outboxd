@@ -29,6 +29,7 @@ type walListener struct {
 	extraColumnsSet map[string]struct{}
 
 	standbyInterval time.Duration
+	closeTimeout    time.Duration
 
 	relations map[uint32]*pglogrepl.RelationMessage
 	typeMap   *pgtype.Map
@@ -275,6 +276,7 @@ func newWALListener(ctx context.Context, dsn string, cfg Config) (*walListener, 
 		deleteQuery:     deleteQuery,
 		extraColumnsSet: extraSet,
 		standbyInterval: cfg.KeepaliveInterval,
+		closeTimeout:    5 * time.Second,
 		batchCh:         make(chan walBatch),
 		errCh:           make(chan error, 1),
 		readCtx:         readCtx,
@@ -507,22 +509,26 @@ func (w *walListener) Confirm(ctx context.Context, ids ...int64) error {
 
 func (w *walListener) Close(ctx context.Context) {
 	w.readStop()
-	readExited := false
 	select {
 	case <-w.readDone:
-		readExited = true
-	case <-time.After(5 * time.Second):
-	}
-
-	if readExited {
+		_ = w.replConn.Conn().SetWriteDeadline(time.Now().Add(2 * time.Second))
 		flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		if err := w.sendStandbyStatus(flushCtx); err != nil && w.logger != nil {
 			w.logger.Error("outbox: final standby status failed", "err", err)
 		}
 		cancel()
+		_ = w.replConn.Close(ctx)
+	case <-time.After(w.closeTimeout):
+		_ = w.replConn.Conn().SetWriteDeadline(time.Now())
+		select {
+		case <-w.readDone:
+			_ = w.replConn.Close(ctx)
+		case <-time.After(w.closeTimeout):
+			// Still stuck: leak replConn rather than race on it. The
+			// server reaps the connection when TCP gives up.
+		}
 	}
 
-	_ = w.replConn.Close(ctx)
 	_ = w.dbConn.Close(ctx)
 }
 
