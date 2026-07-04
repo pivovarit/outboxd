@@ -159,11 +159,13 @@ relay := outboxd.New(databaseURL, handler, outboxd.Config{
 })
 ```
 
-- `GET /health` - liveness probe, always returns `200`
-- `GET /ready` - readiness probe, returns `200` while connected to PostgreSQL, `503` otherwise
+- `GET /health` - liveness probe, returns `200` while the relay is running (the server starts with `Start` and stops when it returns)
+- `GET /ready` - readiness probe, returns `200` while connected to PostgreSQL and delivery is not stalled; `503` otherwise
 - `GET /status` - delivery progress as JSON: total delivered, time of last delivery, and whether delivery is currently blocked retrying a message (and if so, which one, for how long, and how many attempts)
 
-Note that the probes only cover connectivity: a relay stuck retrying a poison message is still alive and connected, so `/health` and `/ready` stay green while no messages flow. `/status` (or `Relay.Status()` in-process) is the signal that catches this - see [Retries and poison messages](#retries-and-poison-messages).
+If `HealthAddr` cannot be bound, `Start` returns the error immediately rather than running without probes.
+
+Readiness covers progress, not just connectivity: once the same message has been failing and retrying for longer than `StalledAfter` (default 5 minutes), `/ready` flips to `503` so an orchestrator can alert or restart the relay instead of leaving it wedged silently. Set `StalledAfter` to a negative value to opt out and make readiness reflect connectivity only. For the full retry picture (which message, how many attempts, since when), use `/status` or `Relay.Status()` - see [Retries and poison messages](#retries-and-poison-messages).
 
 ## Running the example
 
@@ -293,7 +295,7 @@ This mirrors PostgreSQL's own logical replication: a subscription retries a fail
 
 ### If you keep the default, alert on slot lag
 
-`MaxRetries: 0` is the safe default for data integrity, but it turns a poison message into a silent operational hazard in WAL mode: while delivery is stalled the replication slot stops advancing, and PostgreSQL retains all WAL the slot has not confirmed - **unbounded disk growth on the primary**, while `/health` and `/ready` stay green. A relay running the default **must** be paired with slot-lag alerting:
+`MaxRetries: 0` is the safe default for data integrity, but it turns a poison message into a silent operational hazard in WAL mode: while delivery is stalled the replication slot stops advancing, and PostgreSQL retains all WAL the slot has not confirmed - **unbounded disk growth on the primary**. `/ready` flips to `503` after `StalledAfter` (default 5 minutes) of retrying the same message, but a readiness flip alone does not free the disk: a relay running the default **must** still be paired with slot-lag alerting:
 
 ```sql
 SELECT slot_name,

@@ -3,6 +3,7 @@ package outboxd
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net"
 	"net/http"
 	"testing"
@@ -16,15 +17,17 @@ func startTestHealthServer(t *testing.T) (*healthServer, string) {
 
 func startTestHealthServerWithStatus(t *testing.T, status func() Status) (*healthServer, string) {
 	t.Helper()
-	h := newHealthServer(":0", status)
-	ln, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	return startTestHealthServerStalledAfter(t, status, 5*time.Minute)
+}
+
+func startTestHealthServerStalledAfter(t *testing.T, status func() Status, stalledAfter time.Duration) (*healthServer, string) {
+	t.Helper()
+	h := newHealthServer("127.0.0.1:0", status, stalledAfter, slog.Default())
+	if err := h.start(); err != nil {
+		t.Fatalf("start health server: %v", err)
 	}
-	addr := "http://" + ln.Addr().String()
-	go h.listenAndServeOn(ln)
 	t.Cleanup(func() { h.shutdown(context.Background()) })
-	return h, addr
+	return h, "http://" + h.boundAddr()
 }
 
 func TestHealth_AlwaysReturns200(t *testing.T) {
@@ -64,6 +67,106 @@ func TestReady_Returns200WhenReady(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestReady_Returns503WhenStalledOnRetry(t *testing.T) {
+	status := func() Status {
+		return Status{Retrying: true, RetryingID: 7, RetryingSince: time.Now().Add(-10 * time.Minute)}
+	}
+	h, addr := startTestHealthServerStalledAfter(t, status, 5*time.Minute)
+	h.ready.Store(true)
+
+	resp, err := http.Get(addr + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 while stalled on a retrying message, got %d", resp.StatusCode)
+	}
+}
+
+func TestReady_Returns200DuringBriefRetry(t *testing.T) {
+	status := func() Status {
+		return Status{Retrying: true, RetryingID: 7, RetryingSince: time.Now().Add(-time.Second)}
+	}
+	h, addr := startTestHealthServerStalledAfter(t, status, 5*time.Minute)
+	h.ready.Store(true)
+
+	resp, err := http.Get(addr + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 during a retry younger than the stall threshold, got %d", resp.StatusCode)
+	}
+}
+
+func TestReady_NegativeStalledAfterDisablesStallDetection(t *testing.T) {
+	status := func() Status {
+		return Status{Retrying: true, RetryingID: 7, RetryingSince: time.Now().Add(-time.Hour)}
+	}
+	h, addr := startTestHealthServerStalledAfter(t, status, -1)
+	h.ready.Store(true)
+
+	resp, err := http.Get(addr + "/ready")
+	if err != nil {
+		t.Fatalf("GET /ready: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 with stall detection disabled, got %d", resp.StatusCode)
+	}
+}
+
+func TestHealthServer_RestartsAfterShutdown(t *testing.T) {
+	h := newHealthServer("127.0.0.1:0", func() Status { return Status{} }, 5*time.Minute, slog.Default())
+	if err := h.start(); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	if err := h.shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	if err := h.start(); err != nil {
+		t.Fatalf("second start: %v", err)
+	}
+	t.Cleanup(func() { h.shutdown(context.Background()) })
+
+	resp, err := http.Get("http://" + h.boundAddr() + "/health")
+	if err != nil {
+		t.Fatalf("GET /health after restart: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after restart, got %d", resp.StatusCode)
+	}
+}
+
+func TestStart_ReturnsErrorWhenHealthAddrBindFails(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	r := New("", func(context.Context, Message) error { return nil },
+		Config{HealthAddr: ln.Addr().String(), RetryDelay: time.Millisecond})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.Start(ctx) }()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected bind error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not return on health server bind failure")
 	}
 }
 
