@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -88,7 +89,7 @@ type Config struct {
 	RetryDelay   time.Duration
 	// MaxRetries bounds delivery attempts per message: after 1+MaxRetries
 	// failed attempts the message is resolved (dropped, or halted on if
-	// FailStop is set). 0 means retry forever — delivery stalls on the
+	// FailStop is set). 0 means retry forever - delivery stalls on the
 	// failing message and the replication slot retains WAL until it
 	// succeeds, so pair it with slot-lag alerting (see README).
 	MaxRetries int
@@ -98,8 +99,13 @@ type Config struct {
 	// redelivered after a restart. Ignored when MaxRetries is 0.
 	FailStop bool
 	// OnDropped is invoked after a message exhausts MaxRetries and FailStop
-	// is unset — the last chance to persist it (dead-letter) before the
-	// relay confirms and deletes it.
+	// is unset - the last chance to persist it (dead-letter) before the
+	// relay confirms and deletes it. It runs synchronously on the delivery
+	// goroutine: delivery is stalled until it returns, so keep it fast and
+	// bound any I/O with a timeout - a hung callback stalls the relay the
+	// same way a hung handler does. A panic is recovered and logged; the
+	// message is still confirmed and deleted, so a panicking callback loses
+	// the dead-letter write.
 	OnDropped func(msg Message, err error)
 	Schema    SchemaConfig
 	Logger    *slog.Logger
@@ -120,7 +126,7 @@ type Config struct {
 	// which reports delivery progress as JSON (see [Status]). The readiness
 	// probe returns 200 only while the relay has an active connection to
 	// PostgreSQL; note that a relay stuck retrying a poison message still
-	// reports ready — watch /status or [Relay.Status] for that.
+	// reports ready - watch /status or [Relay.Status] for that.
 	// Example: ":8080".
 	HealthAddr string
 }
@@ -382,7 +388,7 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 				r.cfg.Logger.Error("outbox: message dropped",
 					"id", msg.ID, "attempts", retries+1, "err", err)
 				if r.cfg.OnDropped != nil {
-					r.cfg.OnDropped(msg, err)
+					r.invokeOnDropped(msg, err)
 				}
 				return nil
 			}
@@ -405,6 +411,16 @@ func (r *Relay) deliverWithRetry(ctx context.Context, msg Message) error {
 		r.cfg.Logger.Debug("outbox: message delivered", "id", msg.ID, "topic", msg.Topic)
 		return nil
 	}
+}
+
+func (r *Relay) invokeOnDropped(msg Message, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			r.cfg.Logger.Error("outbox: OnDropped panicked, message not dead-lettered",
+				"id", msg.ID, "panic", rec, "stack", string(debug.Stack()))
+		}
+	}()
+	r.cfg.OnDropped(msg, err)
 }
 
 // wrap composes mws around h so that mws[0] is the outermost wrapper.
