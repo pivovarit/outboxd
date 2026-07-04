@@ -42,8 +42,9 @@ type walListener struct {
 
 	buffered []Message
 
-	mu      sync.Mutex
-	tracker *inFlightTracker
+	mu            sync.Mutex
+	tracker       *inFlightTracker
+	lastServerMsg time.Time
 
 	logger interface {
 		Error(msg string, args ...any)
@@ -56,6 +57,8 @@ type walBatch struct {
 }
 
 var errWALClosed = errors.New("outbox: wal listener closed")
+
+const missedKeepalivesLimit = 3
 
 // DropSlot drops the named replication slot from the PostgreSQL server.
 // Call this when permanently decommissioning a relay to prevent WAL
@@ -295,11 +298,22 @@ func (w *walListener) readLoop() {
 
 	var pending []Message
 	nextStandby := time.Now().Add(w.standbyInterval)
+	serverTimeout := missedKeepalivesLimit * w.standbyInterval
+	w.mu.Lock()
+	w.lastServerMsg = time.Now()
+	w.mu.Unlock()
 
 	for {
 		recvCtx, cancel := context.WithDeadline(w.readCtx, nextStandby)
 		rawMsg, err := w.replConn.ReceiveMessage(recvCtx)
 		cancel()
+
+		w.mu.Lock()
+		if err == nil {
+			w.lastServerMsg = time.Now()
+		}
+		silence := time.Since(w.lastServerMsg)
+		w.mu.Unlock()
 
 		if err != nil {
 			if w.readCtx.Err() != nil {
@@ -307,6 +321,11 @@ func (w *walListener) readLoop() {
 			}
 			if !pgconn.Timeout(err) {
 				w.emitErr(fmt.Errorf("outbox: wal receive: %w", err))
+				return
+			}
+			if silence > serverTimeout {
+				w.emitErr(fmt.Errorf("outbox: no message from server in %s (%d keepalive intervals): replication connection lost",
+					silence.Round(time.Millisecond), missedKeepalivesLimit))
 				return
 			}
 		}
@@ -535,11 +554,13 @@ func (w *walListener) Close(ctx context.Context) {
 func (w *walListener) sendStandbyStatus(ctx context.Context) error {
 	w.mu.Lock()
 	lsn := w.tracker.ConfirmedLSN()
+	replyRequested := time.Since(w.lastServerMsg) >= w.standbyInterval
 	w.mu.Unlock()
 	return pglogrepl.SendStandbyStatusUpdate(ctx, w.replConn, pglogrepl.StandbyStatusUpdate{
 		WALWritePosition: lsn,
 		WALFlushPosition: lsn,
 		WALApplyPosition: lsn,
+		ReplyRequested:   replyRequested,
 	})
 }
 
