@@ -117,8 +117,11 @@ type Config struct {
 	// KeepaliveInterval drives both the relay's periodic-confirm ticker and
 	// the WAL listener's standby-status ticker. Bounds how long delivered
 	// rows can linger before deletion and how long a slow handler can
-	// starve replication slot updates. Must stay well below Postgres'
-	// wal_sender_timeout (default 60s).
+	// starve replication slot updates. It also paces dead-connection
+	// detection: when the server has been silent for an interval, standby
+	// updates request an immediate server reply, and three intervals
+	// without any server message are treated as a lost connection. Must
+	// stay well below Postgres' wal_sender_timeout (default 60s).
 	KeepaliveInterval time.Duration
 	// HealthAddr, when set, starts an HTTP server exposing /health
 	// (liveness) and /ready (readiness) probe endpoints, plus /status,

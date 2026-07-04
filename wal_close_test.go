@@ -36,7 +36,11 @@ func fakePGPipe(t *testing.T, drainAfterHandshake bool) net.Conn {
 
 func fakeReplConn(t *testing.T) *pgconn.PgConn {
 	t.Helper()
-	clientEnd := fakePGPipe(t, false)
+	return replConnOver(t, fakePGPipe(t, false))
+}
+
+func replConnOver(t *testing.T, clientEnd net.Conn) *pgconn.PgConn {
+	t.Helper()
 
 	cfg, err := pgconn.ParseConfig("postgres://user@fake:5432/db?sslmode=disable")
 	if err != nil {
