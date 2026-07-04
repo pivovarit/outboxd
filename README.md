@@ -289,6 +289,8 @@ When the handler returns an error, the relay retries the message with exponentia
 
 This mirrors PostgreSQL's own logical replication: a subscription retries a failing transaction forever by default, `disable_on_error` is its fail-stop, and `ALTER SUBSCRIPTION ... SKIP` is its manual drop.
 
+`OnDropped` runs synchronously on the delivery goroutine - it must return before the relay moves on, which is what guarantees the dead-letter write lands before the message is deleted. The flip side: a hung callback stalls delivery just like a hung handler, so bound any I/O in it with a timeout. Panics in `OnDropped` are recovered and logged, but the message is still deleted, so don't rely on panicking to keep a message.
+
 ### If you keep the default, alert on slot lag
 
 `MaxRetries: 0` is the safe default for data integrity, but it turns a poison message into a silent operational hazard in WAL mode: while delivery is stalled the replication slot stops advancing, and PostgreSQL retains all WAL the slot has not confirmed - **unbounded disk growth on the primary**, while `/health` and `/ready` stay green. A relay running the default **must** be paired with slot-lag alerting:

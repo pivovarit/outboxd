@@ -191,6 +191,41 @@ func TestRelay_DropsMessageAfterMaxRetries(t *testing.T) {
 	}
 }
 
+func TestRelay_SurvivesOnDroppedPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	handler := func(_ context.Context, msg Message) error {
+		if msg.ID == 2 {
+			cancel()
+			return nil
+		}
+		return errors.New("permanent error")
+	}
+
+	src := &fakeSource{
+		messages: []Message{
+			{ID: 1, Topic: "poison", Payload: []byte("bad")},
+			{ID: 2, Topic: "ok", Payload: []byte("good")},
+		},
+	}
+
+	cfg := Config{
+		RetryDelay: time.Millisecond,
+		MaxRetries: 1,
+		OnDropped:  func(Message, error) { panic("dead-letter sink exploded") },
+	}
+
+	err := startRelayWithFakeSource(ctx, src, handler, cfg)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	confirmed := src.confirmedSnapshot()
+	if len(confirmed) != 2 {
+		t.Errorf("expected both messages confirmed despite OnDropped panic, got %v", confirmed)
+	}
+}
+
 func TestRelay_DoesNotDropWhenFinalAttemptCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
